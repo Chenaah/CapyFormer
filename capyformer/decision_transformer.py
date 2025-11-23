@@ -20,14 +20,13 @@ from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import DummyVecEnv, VecEnv
 import yaml
 
-from capybararl.decision_transformer.model import Transformer
-from capybararl.decision_transformer.data import ModuleTrajectoryDataset, TrajectoryDataset
+from capyformer.model import Transformer
+from capyformer.data import ModuleTrajectoryDataset, TrajectoryDataset
 import wandb
 
 from tqdm import trange, tqdm
 
-from capybararl.decision_transformer.utils import load_checkpoint, save_checkpoint
-from twist_controller.utils.files import get_cfg_path, load_cfg
+from capyformer.utils import load_checkpoint, save_checkpoint
 
 
 

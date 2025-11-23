@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "capyformer"
+version = "0.1.0"
+description = "A lightweight Transformer library for decision transformers"
+readme = "README.md"
+authors = [
+    {name = "Chen Yu"}
+]
+license = {text = "MIT"}
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+]
+requires-python = ">=3.8"
+dependencies = [
+    "torch>=1.10.0",
+    "numpy>=1.20.0",
+    "gymnasium>=0.26.0",
+    "stable-baselines3>=2.0.0",
+    "omegaconf>=2.1.0",
+    "imageio>=2.9.0",
+    "tqdm>=4.60.0",
+    "pyyaml>=5.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "black>=22.0.0",
+    "flake8>=4.0.0",
+]
+ray = [
+    "ray>=2.0.0",
+]
+wandb = [
+    "wandb>=0.12.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Chenaah/CapyFormer"
+Repository = "https://github.com/Chenaah/CapyFormer"
+
+[tool.setuptools.packages.find]
+include = ["capyformer*"]
+exclude = ["tests*", "examples*"]
