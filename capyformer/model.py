@@ -260,15 +260,14 @@ class Transformer(nn.Module):
 
 if __name__ == "__main__":
 
-    model = DecisionTransformer(
-        state_dim=40,
+    model = Transformer(
+        state_token_dims=[8,8,8,8,8], 
         act_dim=5,
         n_blocks=1,
         h_dim=128,
         context_len=60,
         n_heads=1,
         drop_p=0.1,
-        state_token_dims=[8,8,8,8,8], 
         shared_state_embedding=True
     )
     with torch.no_grad():
@@ -283,26 +282,28 @@ if __name__ == "__main__":
         actions=torch.zeros((256, 60, 5))     # action dimension is 5
     )
 
+    print(out[1].shape)
 
-    model2 = DecisionTransformerOld(
-        state_dim=40,
-        act_dim=5,
-        n_blocks=1,
-        h_dim=128,
-        context_len=60,
-        n_heads=1,
-        drop_p=0.1,
-        independent_module_tokens=True
-    )
 
-    with torch.no_grad():
-        for param in model2.parameters():
-            param.fill_(0.23)
-    model2.state_dict()
-    out2 = model2.forward(
-        timesteps=torch.zeros((256, 60), dtype=torch.int64),  # 60 timesteps
-        states=torch.zeros((256, 60, 40)),  # 5 tokens, each with dimension 8
-        actions=torch.zeros((256, 60, 5))     # action dimension is 5
-    )
+    # model2 = DecisionTransformerOld(
+    #     state_dim=40,
+    #     act_dim=5,
+    #     n_blocks=1,
+    #     h_dim=128,
+    #     context_len=60,
+    #     n_heads=1,
+    #     drop_p=0.1,
+    #     independent_module_tokens=True
+    # )
 
-    pdb.set_trace()
+    # with torch.no_grad():
+    #     for param in model2.parameters():
+    #         param.fill_(0.23)
+    # model2.state_dict()
+    # out2 = model2.forward(
+    #     timesteps=torch.zeros((256, 60), dtype=torch.int64),  # 60 timesteps
+    #     states=torch.zeros((256, 60, 40)),  # 5 tokens, each with dimension 8
+    #     actions=torch.zeros((256, 60, 5))     # action dimension is 5
+    # )
+
+    # pdb.set_trace()

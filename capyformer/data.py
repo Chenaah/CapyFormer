@@ -147,6 +147,44 @@ class TrajectoryDataset(Dataset):
         Reshape the states to match the expected input shape.
         """
         return states
+    
+
+class ToyDataset(TrajectoryDataset):
+
+    def _setup_dataset(self, dataset_config):
+        # Create some toy data
+        self.state_token_dims = [2, 2]
+        self.act_dim = 2
+
+        self.trajectories = []
+        for _ in range(100):
+            traj_len = random.randint(10, 50)
+            states = np.zeros((traj_len, 2, 2))
+            states[:,0,:] = 1 + 0.1*np.random.randn(traj_len, 2)
+            states[:,1,:] = 2 + 0.1*np.random.randn(traj_len, 2)
+            actions = np.repeat((states[:,0,0] + states[:,1,0]).reshape(-1,1), repeats=2, axis=1) 
+            self.trajectories.append({
+                'observations': states,
+                'actions': actions,
+            })
+
+        # calculate min len of traj, state mean and variance 
+        # and returns_to_go for all traj
+        min_len = 10**6
+        states = []
+        for traj in self.trajectories:
+            traj_len = traj['observations'].shape[0]
+            min_len = min(min_len, traj_len)
+            states.append(traj['observations'])
+
+        # used for input normalization
+        states = np.concatenate(states, axis=0)
+        self.state_mean, self.state_std = np.mean(states, axis=0), np.std(states, axis=0) + 1e-6
+        print(f"State mean: {self.state_mean}, State std: {self.state_std}")
+        # normalize states
+        for traj in self.trajectories:
+            traj['observations'] = (traj['observations'] - self.state_mean) / self.state_std
+
 
 
 

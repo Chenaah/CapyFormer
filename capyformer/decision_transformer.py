@@ -21,7 +21,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecEnv
 import yaml
 
 from capyformer.model import Transformer
-from capyformer.data import ModuleTrajectoryDataset, TrajectoryDataset
+from capyformer.data import ModuleTrajectoryDataset, ToyDataset, TrajectoryDataset
 import wandb
 
 from tqdm import trange, tqdm
@@ -403,22 +403,23 @@ if __name__ == "__main__":
     # parser.add_argument('cfg', nargs='+', default=['sim_train_tf5'])
     # args = parser.parse_args()
     # conf_name = args.cfg[0]
-    conf = load_cfg('sim_train_tf5', alg="tf")
+    # conf = load_cfg('sim_train_tf5', alg="tf")
 
     # Call train with explicit parameters
     dataset_path_list = glob.glob("./debug/test_dataset/*.npz")
-    context_len=60
+    context_len=10
     data_cfg = {"dataset_path": dataset_path_list}
-    traj_dataset = ModuleTrajectoryDataset(data_cfg, context_len)
+    traj_dataset = ToyDataset(data_cfg, context_len)
     
     dt = DecisionTransformer(
         traj_dataset,
         log_dir="./debug",
         use_action_tanh=False,
-        shared_state_embedding=True,
+        shared_state_embedding=False,
         n_blocks=3,
         h_dim=256,
         n_heads=1,
+        batch_size=32
     )
     dt.learn(
         n_epochs=10000,
