@@ -48,7 +48,9 @@ class DecisionTransformer():
                 learning_rate: float = 1e-4,
                 wt_decay: float = 0.005,
                 warmup_steps: int = 10000,
-                seed: int = 0):
+                seed: int = 0,
+                validation_freq: int = 100,
+                validation_trajectories: int = 10):
 
         self.traj_dataset = dataset
         self.act_dim = dataset.act_dim
@@ -69,6 +71,94 @@ class DecisionTransformer():
         self.wt_decay = wt_decay
         self.warmup_steps = warmup_steps
         self.seed = seed
+        self.validation_freq = validation_freq
+        self.validation_trajectories = validation_trajectories
+
+    def validate_rollout(self, model, device):
+        """
+        Validate the model by performing trajectory rollouts.
+        For each sampled trajectory:
+        1. Start from the initial state
+        2. Predict the first action using only the first state
+        3. Use the predicted action and the actual next state to predict the next action
+        4. Continue rolling out predictions using actual states but predicted actions
+        5. Compute the error between predicted and actual actions
+        
+        Returns:
+            Average MSE across all validation trajectories
+        """
+        model.eval()
+        total_mse = 0.0
+        num_predictions = 0
+        
+        with torch.no_grad():
+            for _ in range(self.validation_trajectories):
+                # Sample a random trajectory from the dataset
+                traj_idx = random.randint(0, len(self.traj_dataset.trajectories) - 1)
+                traj = self.traj_dataset.trajectories[traj_idx]
+                
+                # Get trajectory length
+                traj_len = traj['observations'].shape[0]
+                if traj_len < 2:
+                    continue
+                
+                # Normalize observations using dataset stats
+                # states = (traj['observations'] - self.traj_dataset.state_mean) / self.traj_dataset.state_std
+                actions_gt = traj['actions']
+                
+                actions = torch.zeros((1, traj_len, self.act_dim),
+                        dtype=torch.float32, device=device)
+                states = torch.zeros(1, traj_len, *self.state_token_dims,
+                                    dtype=torch.float32, device=device)
+                timesteps = torch.arange(start=0, end=traj_len, step=1)
+                timesteps = timesteps.repeat(1, 1).to(device)
+                
+                # Predict actions step by step
+                predicted_actions = []
+                for t in range(traj_len - 1):
+
+                    running_state = traj['observations'][t] # (traj['observations'][t] - self.traj_dataset.state_mean) / self.traj_dataset.state_std
+
+                    if t < self.context_len:
+
+                        states[:,t,:] = torch.tensor(running_state, device=device)
+                        # Use context from start to current position
+                        _, act_preds, _ = model.forward(timesteps[:,:self.context_len],
+                                                states[:,:self.context_len],
+                                                actions[:,:self.context_len])
+
+                        # Get prediction at position t
+                        pred_action = act_preds[:, t].detach()
+                    else:
+                        _, act_preds, _ = model.forward(timesteps[:,t-self.context_len+1:t+1],
+                                            states[:,t-self.context_len+1:t+1],
+                                            actions[:,t-self.context_len+1:t+1])
+                        # Get prediction at the last position
+                        pred_action = act_preds[:, -1].detach()
+                    
+                    actions[:, t] = pred_action
+                    
+                    # Store the predicted action
+                    predicted_actions.append(pred_action.squeeze(0).cpu())
+                    
+                
+                # Compute MSE between predicted and actual actions
+                if len(predicted_actions) > 0:
+                    predicted_actions = torch.stack(predicted_actions)
+                    actual_actions = torch.from_numpy(actions_gt[:len(predicted_actions)]).float()
+                    
+                    mse = F.mse_loss(predicted_actions, actual_actions, reduction='sum')
+                    total_mse += mse.item()
+                    num_predictions += len(predicted_actions)
+                    # print(f"Trajectory MSE: {mse.item():.6f}")
+        
+        model.train()
+        
+        if num_predictions > 0:
+            avg_mse = total_mse / num_predictions
+            return avg_mse
+        else:
+            return 0.0
 
     def learn(
         self,
@@ -83,7 +173,7 @@ class DecisionTransformer():
 
         log_csv_path = os.path.join(self.log_dir, "log.csv")
         csv_writer = csv.writer(open(log_csv_path, 'a', 1))
-        csv_header = (["loss"])
+        csv_header = (["loss", "validation_mse"])
         csv_writer.writerow(csv_header)
 
 
@@ -144,7 +234,7 @@ class DecisionTransformer():
         if self.load_run is not None:
             # Load checkpoint if specified
             assert self.load_run.endswith(".pt"), "Only .pt run files supported"
-            model, optimizer, scheduler, start_epoch = load_checkpoint(model, optimizer, scheduler, load_run, device=device)
+            model, optimizer, scheduler, start_epoch = load_checkpoint(model, optimizer, scheduler, self.load_run, device=device)
 
         torch.manual_seed(self.seed)
         random.seed(self.seed)
@@ -190,8 +280,7 @@ class DecisionTransformer():
                 loss_value = action_loss.detach().cpu().item()
                 if self.wandb_on:
                     wandb.log({"Loss": loss_value})
-                tqdm.write(f"Loss: {loss_value}")
-                csv_writer.writerow([loss_value])
+                # tqdm.write(f"Loss: {loss_value}")
 
                 total_updates += num_updates_per_iter
 
@@ -199,6 +288,19 @@ class DecisionTransformer():
 
             
             inner_bar.reset()
+
+            # Perform validation rollout
+            validation_mse = 0.0
+            if epoch % self.validation_freq == 0:
+                tqdm.write(f"Performing validation rollout at epoch {epoch}...")
+                validation_mse = self.validate_rollout(model, device)
+                tqdm.write(f"Validation MSE: {validation_mse:.6f}")
+                if self.wandb_on:
+                    wandb.log({"Validation_MSE": validation_mse})
+            
+            # Log average loss and validation mse for the epoch
+            avg_epoch_loss = np.mean(log_action_losses) if log_action_losses else 0.0
+            csv_writer.writerow([avg_epoch_loss, validation_mse])
 
             # DEBUG!!!!
             # if epoch % 100 == 0:
@@ -369,7 +471,6 @@ class ModularDecisionTransformer(DecisionTransformer):
                 if self.wandb_on:
                     wandb.log({"Loss": loss_value})
                 tqdm.write(f"Loss: {loss_value}")
-                csv_writer.writerow([loss_value])
 
                 total_updates += num_updates_per_iter
 
@@ -377,6 +478,19 @@ class ModularDecisionTransformer(DecisionTransformer):
 
             
             inner_bar.reset()
+
+            # Perform validation rollout
+            validation_mse = 0.0
+            if epoch % self.validation_freq == 0:
+                tqdm.write(f"Performing validation rollout at epoch {epoch}...")
+                validation_mse = self.validate_rollout(model, device)
+                tqdm.write(f"Validation MSE: {validation_mse:.6f}")
+                if self.wandb_on:
+                    wandb.log({"Validation_MSE": validation_mse})
+            
+            # Log average loss and validation mse for the epoch
+            avg_epoch_loss = np.mean(log_action_losses) if log_action_losses else 0.0
+            csv_writer.writerow([avg_epoch_loss, validation_mse])
 
             if epoch % 100 == 0:
                 save_checkpoint(model, optimizer, scheduler, epoch, os.path.join(self.log_dir, str(epoch)+"epoch.pt"))
