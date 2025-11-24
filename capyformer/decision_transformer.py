@@ -14,6 +14,7 @@ import gymnasium as gym
 import numpy as np
 from omegaconf import OmegaConf
 import torch
+import matplotlib.pyplot as plt
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from stable_baselines3.common.env_util import make_vec_env
@@ -21,7 +22,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecEnv
 import yaml
 
 from capyformer.model import Transformer
-from capyformer.data import ModuleTrajectoryDataset, ToyDataset, TrajectoryDataset
+from capyformer.data import ModuleTrajectoryDataset, ToyDataset, ToyDatasetPositionEstimator, TrajectoryDataset
 import wandb
 
 from tqdm import trange, tqdm
@@ -151,6 +152,36 @@ class DecisionTransformer():
                     total_mse += mse.item()
                     num_predictions += len(predicted_actions)
                     # print(f"Trajectory MSE: {mse.item():.6f}")
+                    
+                    # Plot 2D trajectories if action dimension is 2
+                    plot_position = False
+                    if self.act_dim == 2 and plot_position:
+                        pred_actions_np = predicted_actions.numpy()
+                        actual_actions_np = actual_actions.numpy()
+                        
+                        plt.figure(figsize=(10, 8))
+                        plt.plot(actual_actions_np[:, 0], actual_actions_np[:, 1], 
+                                'b-o', label='Actual Actions', linewidth=2, markersize=4, alpha=0.7)
+                        plt.plot(pred_actions_np[:, 0], pred_actions_np[:, 1], 
+                                'r--s', label='Predicted Actions', linewidth=2, markersize=4, alpha=0.7)
+                        
+                        # Mark start and end points
+                        plt.plot(actual_actions_np[0, 0], actual_actions_np[0, 1], 
+                                'go', markersize=10, label='Start')
+                        plt.plot(actual_actions_np[-1, 0], actual_actions_np[-1, 1], 
+                                'ko', markersize=10, label='End')
+                        
+                        plt.xlabel('Action Dimension 0', fontsize=12)
+                        plt.ylabel('Action Dimension 1', fontsize=12)
+                        plt.title(f'2D Trajectory Comparison (Traj {traj_idx}, MSE: {mse.item():.6f})', fontsize=14)
+                        plt.legend(fontsize=10)
+                        plt.grid(True, alpha=0.3)
+                        plt.tight_layout()
+                        
+                        # Save figure
+                        plot_path = os.path.join(self.log_dir, f'trajectory_validation_{traj_idx}.png')
+                        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+                        plt.close()
         
         model.train()
         
@@ -523,7 +554,7 @@ if __name__ == "__main__":
     dataset_path_list = glob.glob("./debug/test_dataset/*.npz")
     context_len=10
     data_cfg = {"dataset_path": dataset_path_list}
-    traj_dataset = ToyDataset(data_cfg, context_len)
+    traj_dataset = ToyDatasetPositionEstimator(data_cfg, context_len)
     
     dt = DecisionTransformer(
         traj_dataset,

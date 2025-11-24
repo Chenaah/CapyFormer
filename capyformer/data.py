@@ -186,6 +186,63 @@ class ToyDataset(TrajectoryDataset):
             traj['observations'] = (traj['observations'] - self.state_mean) / self.state_std
 
 
+class ToyDatasetPositionEstimator(TrajectoryDataset):
+    """
+    Toy dataset for testing position estimator.
+    states[:,0] is a 2D velocity vector
+    states[:,1] is a 2D random vector
+    actions are the positions, starting from (0,0) for each trajectory,
+    obtained by integrating the velocity vectors.
+    """
+
+    def _setup_dataset(self, dataset_config):
+        # Create toy data for position estimation
+        self.state_token_dims = [2, 2]
+        self.act_dim = 2
+
+        self.trajectories = []
+        for _ in range(100000):
+            traj_len = random.randint(10, 50)
+            states = np.zeros((traj_len, 2, 2))
+            
+            # states[:,0] is a 2D velocity vector (with some noise)
+            states[:,0,:] = 0.5 + 0.2*np.random.randn(traj_len, 2)
+            
+            # states[:,1] is a 2D random vector
+            states[:,1,:] = np.random.randn(traj_len, 2)
+            
+            # actions are positions obtained by integrating velocity
+            # Starting from (0, 0) for each trajectory
+            positions = np.zeros((traj_len, 2))
+            positions[0] = np.array([0.0, 0.0])
+            for t in range(1, traj_len):
+                # Integrate velocity to get position (simple Euler integration)
+                positions[t] = positions[t-1] + states[t-1, 0, :]
+            
+            self.trajectories.append({
+                'observations': states,
+                'actions': positions,
+            })
+
+        # calculate min len of traj, state mean and variance 
+        # and returns_to_go for all traj
+        min_len = 10**6
+        states = []
+        for traj in self.trajectories:
+            traj_len = traj['observations'].shape[0]
+            min_len = min(min_len, traj_len)
+            states.append(traj['observations'])
+
+        # used for input normalization
+        states = np.concatenate(states, axis=0)
+        self.state_mean, self.state_std = np.mean(states, axis=0), np.std(states, axis=0) + 1e-6
+        print(f"State mean: {self.state_mean}, State std: {self.state_std}")
+        
+        # normalize states
+        for traj in self.trajectories:
+            traj['observations'] = (traj['observations'] - self.state_mean) / self.state_std
+
+
 
 
 class ModuleTrajectoryDataset(TrajectoryDataset):
