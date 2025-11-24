@@ -95,7 +95,7 @@ class Block(nn.Module):
 class Transformer(nn.Module):
     def __init__(self, state_token_dims, act_dim, n_blocks, h_dim, context_len,
                  n_heads, drop_p, max_timestep=4096, state_mean=None, state_std=None,
-                 use_action_tanh=False, shared_state_embedding=True):
+                 use_action_tanh=False, shared_state_embedding=True, state_token_names=None):
         super().__init__()
 
         self.act_dim = act_dim
@@ -103,6 +103,11 @@ class Transformer(nn.Module):
         self.max_timestep = max_timestep
         self.shared_state_embedding = shared_state_embedding
         
+        # Store state token names (keys for the state dictionary)
+        if state_token_names is None:
+            # Default names if not provided
+            state_token_names = [f"token_{i}" for i in range(len(state_token_dims))]
+        self.state_token_names = state_token_names
         
         # Register as buffer for TorchScript compatibility
         self.register_buffer('state_token_dims', torch.tensor(state_token_dims, dtype=torch.long))
@@ -128,14 +133,14 @@ class Transformer(nn.Module):
                 raise ValueError("When using shared_state_embedding=True, all state tokens must have the same dimension. "
                                f"Got dimensions: {self.state_token_dims}")
             self.shared_state_embed = nn.Linear(int(self.state_token_dims[0].item()), h_dim)
-            # Create empty ModuleList for TorchScript compatibility
-            self.state_embedding_layers = nn.ModuleList()
+            # Create empty ModuleDict for TorchScript compatibility
+            self.state_embedding_layers = nn.ModuleDict()
         else:
-            # Each token has its own embedding layer
-            self.state_embedding_layers = nn.ModuleList()
-            for i in range(self.num_state_tokens):
+            # Each token has its own embedding layer (using dict with token names as keys)
+            self.state_embedding_layers = nn.ModuleDict()
+            for i, name in enumerate(self.state_token_names):
                 dim = int(self.state_token_dims[i].item())
-                self.state_embedding_layers.append(nn.Linear(dim, h_dim))
+                self.state_embedding_layers[name] = nn.Linear(dim, h_dim)
             # Create a dummy layer for TorchScript compatibility
             self.shared_state_embed = nn.Linear(1, h_dim)  # Dummy layer, won't be used
 
@@ -154,8 +159,22 @@ class Transformer(nn.Module):
             *([nn.Linear(h_dim, act_dim)] + ([nn.Tanh()] if use_action_tanh else []))
         )
 
-        self.state_mean = torch.tensor(state_mean) if state_mean is not None else None
-        self.state_std = torch.tensor(state_std) if state_std is not None else None
+        # Handle both dictionary and tensor formats for state_mean and state_std
+        if state_mean is not None:
+            if isinstance(state_mean, dict):
+                self.state_mean = {key: torch.tensor(value) for key, value in state_mean.items()}
+            else:
+                self.state_mean = torch.tensor(state_mean)
+        else:
+            self.state_mean = None
+            
+        if state_std is not None:
+            if isinstance(state_std, dict):
+                self.state_std = {key: torch.tensor(value) for key, value in state_std.items()}
+            else:
+                self.state_std = torch.tensor(state_std)
+        else:
+            self.state_std = None
 
 
     def forward(self, timesteps, states, actions):
@@ -164,20 +183,22 @@ class Transformer(nn.Module):
         
         Args:
             timesteps: Tensor of shape (B, T) with timestep indices
-            states: Tensor of shape (B, T, num_tokens, token_dim) where each token can have different dims
-                   OR (B, T, state_dim) for backward compatibility (single token)
+            states: Dictionary where keys are state token names (e.g., 'position', 'velocity')
+                   and values are tensors of shape (B, T, token_dim) where token_dim can vary per token
             actions: Tensor of shape (B, T, act_dim)
         """
         
-        if len(states.shape) == 3:
-            # Legacy format: (B, T, state_dim) - treat as single token
-            B, T, _ = states.shape
-            states = states.unsqueeze(2)  # (B, T, 1, state_dim)
-        else:
-            # New format: (B, T, num_tokens, token_dim)
-            B, T, num_tokens, _ = states.shape
-            if num_tokens != self.num_state_tokens:
-                raise ValueError(f"Expected {self.num_state_tokens} state tokens, got {num_tokens}")
+        # Check if states is a dictionary
+        if not isinstance(states, dict):
+            raise ValueError("states must be a dictionary with state token names as keys")
+        
+        # Verify all expected state tokens are present
+        if set(states.keys()) != set(self.state_token_names):
+            raise ValueError(f"Expected state keys {self.state_token_names}, got {list(states.keys())}")
+        
+        # Get batch size and sequence length from the first state token
+        first_token = states[self.state_token_names[0]]
+        B, T, _ = first_token.shape
 
         time_embeddings = self.embed_timestep(timesteps)
 
@@ -188,17 +209,15 @@ class Transformer(nn.Module):
         state_embeddings = []
         if self.shared_state_embedding:
             # Use shared embedding for all tokens
-            for i in range(self.num_state_tokens):
-                token_dim = int(self.state_token_dims[i].item())
-                state_token = states[:, :, i, :token_dim]  # (B, T, token_dim) - slice to actual dimension
+            for token_name in self.state_token_names:
+                state_token = states[token_name]  # (B, T, token_dim)
                 embedding = self.shared_state_embed(state_token) + time_embeddings
                 state_embeddings.append(embedding)
         else:
-            # Use separate embeddings - enumerate for TorchScript compatibility
-            for i, embedding_layer in enumerate(self.state_embedding_layers):
-                token_dim = int(self.state_token_dims[i].item())
-                state_token = states[:, :, i, :token_dim]  # (B, T, token_dim) - slice to actual dimension
-                embedding = embedding_layer(state_token) + time_embeddings
+            # Use separate embeddings
+            for token_name in self.state_token_names:
+                state_token = states[token_name]  # (B, T, token_dim)
+                embedding = self.state_embedding_layers[token_name](state_token) + time_embeddings
                 state_embeddings.append(embedding)
         
         # Stack all embeddings: state tokens + action token
@@ -260,8 +279,10 @@ class Transformer(nn.Module):
 
 if __name__ == "__main__":
 
+    # Example with dictionary states
     model = Transformer(
         state_token_dims=[8,8,8,8,8], 
+        state_token_names=['module_0', 'module_1', 'module_2', 'module_3', 'module_4'],
         act_dim=5,
         n_blocks=1,
         h_dim=128,
@@ -276,9 +297,18 @@ if __name__ == "__main__":
 
     model.state_dict()
 
+    # Create states as a dictionary
+    states_dict = {
+        'module_0': torch.zeros((256, 60, 8)),
+        'module_1': torch.zeros((256, 60, 8)),
+        'module_2': torch.zeros((256, 60, 8)),
+        'module_3': torch.zeros((256, 60, 8)),
+        'module_4': torch.zeros((256, 60, 8)),
+    }
+
     out = model.forward(
         timesteps=torch.zeros((256, 60), dtype=torch.int64),  # 60 timesteps
-        states=torch.zeros((256, 60, 5, 8)),  # 5 tokens, each with dimension 8
+        states=states_dict,  # Dictionary of state tokens
         actions=torch.zeros((256, 60, 5))     # action dimension is 5
     )
 

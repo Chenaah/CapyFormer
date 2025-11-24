@@ -31,7 +31,7 @@ from capyformer.utils import load_checkpoint, save_checkpoint
 
 
 
-class DecisionTransformer():
+class Trainer():
 
     def __init__(self, 
                 dataset: TrajectoryDataset,
@@ -98,41 +98,71 @@ class DecisionTransformer():
                 traj_idx = random.randint(0, len(self.traj_dataset.trajectories) - 1)
                 traj = self.traj_dataset.trajectories[traj_idx]
                 
+                # Check if observations is a dictionary (new format) or array (legacy format)
+                is_dict_format = isinstance(traj['observations'], dict)
+                
                 # Get trajectory length
-                traj_len = traj['observations'].shape[0]
+                if is_dict_format:
+                    first_key = list(traj['observations'].keys())[0]
+                    traj_len = traj['observations'][first_key].shape[0]
+                else:
+                    traj_len = traj['observations'].shape[0]
+                    
                 if traj_len < 2:
                     continue
                 
-                # Normalize observations using dataset stats
-                # states = (traj['observations'] - self.traj_dataset.state_mean) / self.traj_dataset.state_std
                 actions_gt = traj['actions']
                 
                 actions = torch.zeros((1, traj_len, self.act_dim),
                         dtype=torch.float32, device=device)
-                states = torch.zeros(1, traj_len, *self.state_token_dims,
-                                    dtype=torch.float32, device=device)
+                
+                # Initialize states based on format
+                if is_dict_format:
+                    states = {key: torch.zeros((1, traj_len, traj['observations'][key].shape[1]),
+                                               dtype=torch.float32, device=device)
+                             for key in traj['observations'].keys()}
+                else:
+                    states = torch.zeros(1, traj_len, *self.state_token_dims,
+                                        dtype=torch.float32, device=device)
+                
                 timesteps = torch.arange(start=0, end=traj_len, step=1)
                 timesteps = timesteps.repeat(1, 1).to(device)
                 
                 # Predict actions step by step
                 predicted_actions = []
                 for t in range(traj_len - 1):
-
-                    running_state = traj['observations'][t] # (traj['observations'][t] - self.traj_dataset.state_mean) / self.traj_dataset.state_std
+                    
+                    if is_dict_format:
+                        # Dictionary format: update each state token
+                        for key in traj['observations'].keys():
+                            running_state = traj['observations'][key][t]
+                            states[key][:,t,:] = torch.tensor(running_state, device=device)
+                    else:
+                        # Legacy format: update single state tensor
+                        running_state = traj['observations'][t]
+                        states[:,t,:] = torch.tensor(running_state, device=device)
 
                     if t < self.context_len:
-
-                        states[:,t,:] = torch.tensor(running_state, device=device)
                         # Use context from start to current position
+                        if is_dict_format:
+                            states_slice = {key: states[key][:,:self.context_len] for key in states.keys()}
+                        else:
+                            states_slice = states[:,:self.context_len]
+                            
                         _, act_preds, _ = model.forward(timesteps[:,:self.context_len],
-                                                states[:,:self.context_len],
+                                                states_slice,
                                                 actions[:,:self.context_len])
 
                         # Get prediction at position t
                         pred_action = act_preds[:, t].detach()
                     else:
+                        if is_dict_format:
+                            states_slice = {key: states[key][:,t-self.context_len+1:t+1] for key in states.keys()}
+                        else:
+                            states_slice = states[:,t-self.context_len+1:t+1]
+                            
                         _, act_preds, _ = model.forward(timesteps[:,t-self.context_len+1:t+1],
-                                            states[:,t-self.context_len+1:t+1],
+                                            states_slice,
                                             actions[:,t-self.context_len+1:t+1])
                         # Get prediction at the last position
                         pred_action = act_preds[:, -1].detach()
@@ -154,7 +184,7 @@ class DecisionTransformer():
                     # print(f"Trajectory MSE: {mse.item():.6f}")
                     
                     # Plot 2D trajectories if action dimension is 2
-                    plot_position = False
+                    plot_position = True
                     if self.act_dim == 2 and plot_position:
                         pred_actions_np = predicted_actions.numpy()
                         actual_actions_np = actual_actions.numpy()
@@ -233,11 +263,15 @@ class DecisionTransformer():
         
         ## get state stats from dataset
         state_mean, state_std = self.traj_dataset.get_state_stats()
+        
+        # Get state token names from dataset if available
+        state_token_names = getattr(self.traj_dataset, 'state_token_names', None)
 
         start_epoch = 0
 
         model = Transformer(
             state_token_dims=self.state_token_dims,
+            state_token_names=state_token_names,
             act_dim=self.act_dim,
             n_blocks=self.n_blocks,
             h_dim=self.h_dim,
@@ -283,7 +317,15 @@ class DecisionTransformer():
             for timesteps, states, actions, traj_mask in iter(traj_data_loader):
 
                 timesteps = timesteps.to(device)    # B x T
-                states = states.to(device)          # B x T x state_dim
+                
+                # Handle dictionary or tensor states
+                if isinstance(states, dict):
+                    # Dictionary format: move each state token to device
+                    states = {key: value.to(device) for key, value in states.items()}
+                else:
+                    # Legacy tensor format
+                    states = states.to(device)          # B x T x state_dim
+                    
                 actions = actions.to(device)        # B x T x act_dim
                 # returns_to_go = returns_to_go.to(device).unsqueeze(dim=-1) # B x T x 1
                 traj_mask = traj_mask.to(device)    # B x T
@@ -370,7 +412,7 @@ def _save_conf(conf, conf_name, log_dir, notes=None):
 
 
 
-class ModularDecisionTransformer(DecisionTransformer):
+class ModularDecisionTransformer(Trainer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -417,11 +459,15 @@ class ModularDecisionTransformer(DecisionTransformer):
         
         ## get state stats from dataset
         state_mean, state_std = self.traj_dataset.get_state_stats()
+        
+        # Get state token names from dataset if available
+        state_token_names = getattr(self.traj_dataset, 'state_token_names', None)
 
         start_epoch = 0
 
         model = Transformer(
             state_token_dims=self.state_token_dims,
+            state_token_names=state_token_names,
             act_dim=self.act_dim,
             n_blocks=self.n_blocks,
             h_dim=self.h_dim,
@@ -556,7 +602,7 @@ if __name__ == "__main__":
     data_cfg = {"dataset_path": dataset_path_list}
     traj_dataset = ToyDatasetPositionEstimator(data_cfg, context_len)
     
-    dt = DecisionTransformer(
+    dt = Trainer(
         traj_dataset,
         log_dir="./debug",
         use_action_tanh=False,

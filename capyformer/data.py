@@ -83,8 +83,18 @@ class TrajectoryDataset(Dataset):
     def get_state_stats(self):
         # if body:
         #     return self.state_mean, self.state_std, self.body_mean, self.body_std
-        assert not np.any(np.isnan(self.state_mean)), "State mean contains NaN values"
-        assert not np.any(np.isnan(self.state_std)), "State std contains NaN values"
+        
+        # Check if state_mean is a dictionary (new format) or array (legacy format)
+        if isinstance(self.state_mean, dict):
+            # Dictionary format: check each token
+            for key in self.state_mean.keys():
+                assert not np.any(np.isnan(self.state_mean[key])), f"State mean for '{key}' contains NaN values"
+                assert not np.any(np.isnan(self.state_std[key])), f"State std for '{key}' contains NaN values"
+        else:
+            # Legacy format
+            assert not np.any(np.isnan(self.state_mean)), "State mean contains NaN values"
+            assert not np.any(np.isnan(self.state_std)), "State std contains NaN values"
+        
         return self.state_mean, self.state_std
 
 
@@ -93,16 +103,34 @@ class TrajectoryDataset(Dataset):
 
     def __getitem__(self, idx):
         traj = self.trajectories[idx]
-        traj_len = traj['observations'].shape[0]
         dtype = torch.float32
+        
+        # Check if observations is a dictionary (new format) or array (legacy format)
+        is_dict_format = isinstance(traj['observations'], dict)
+        
+        if is_dict_format:
+            # New dictionary format
+            # Get trajectory length from the first state token
+            first_key = list(traj['observations'].keys())[0]
+            traj_len = traj['observations'][first_key].shape[0]
+        else:
+            # Legacy array format
+            traj_len = traj['observations'].shape[0]
 
         if traj_len >= self.context_len:
             # sample random index to slice trajectory
             si = random.randint(0, traj_len - self.context_len)
 
-            states = torch.from_numpy(traj['observations'][si : si + self.context_len]).to(dtype)
+            if is_dict_format:
+                # Dictionary format: slice each state token separately
+                states = {}
+                for key, value in traj['observations'].items():
+                    states[key] = torch.from_numpy(value[si : si + self.context_len]).to(dtype)
+            else:
+                # Legacy array format
+                states = torch.from_numpy(traj['observations'][si : si + self.context_len]).to(dtype)
+            
             actions = torch.from_numpy(traj['actions'][si : si + self.context_len]).to(dtype)
-            # returns_to_go = torch.from_numpy(traj['returns_to_go'][si : si + self.context_len])
             timesteps = torch.arange(start=si, end=si+self.context_len, step=1)
 
             # all ones since no padding
@@ -111,25 +139,29 @@ class TrajectoryDataset(Dataset):
         else:
             padding_len = self.context_len - traj_len
 
-            # padding with zeros
-            states = torch.from_numpy(traj['observations']).to(dtype)
-            states = torch.cat([states,
-                                torch.zeros(([padding_len] + list(states.shape[1:])),
-                                dtype=dtype)],
-                               dim=0)
+            if is_dict_format:
+                # Dictionary format: pad each state token separately
+                states = {}
+                for key, value in traj['observations'].items():
+                    state_tensor = torch.from_numpy(value).to(dtype)
+                    padded_state = torch.cat([state_tensor,
+                                            torch.zeros(([padding_len] + list(state_tensor.shape[1:])),
+                                            dtype=dtype)],
+                                           dim=0)
+                    states[key] = padded_state
+            else:
+                # Legacy array format
+                states = torch.from_numpy(traj['observations']).to(dtype)
+                states = torch.cat([states,
+                                    torch.zeros(([padding_len] + list(states.shape[1:])),
+                                    dtype=dtype)],
+                                   dim=0)
 
             actions = torch.from_numpy(traj['actions']).to(dtype)
             actions = torch.cat([actions,
                                 torch.zeros(([padding_len] + list(actions.shape[1:])),
                                 dtype=dtype)],
                                dim=0)
-
-            # returns_to_go = torch.from_numpy(traj['returns_to_go'])
-            # returns_to_go = torch.cat([returns_to_go,
-            #                     torch.zeros(([padding_len] + list(returns_to_go.shape[1:])),
-            #                     dtype=returns_to_go.dtype)],
-            #                    dim=0)
-            # pdb.set_trace()
 
             timesteps = torch.arange(start=0, end=self.context_len, step=1)
 
@@ -154,43 +186,55 @@ class ToyDataset(TrajectoryDataset):
     def _setup_dataset(self, dataset_config):
         # Create some toy data
         self.state_token_dims = [2, 2]
+        self.state_token_names = ['position', 'velocity']
         self.act_dim = 2
 
         self.trajectories = []
         for _ in range(100):
             traj_len = random.randint(10, 50)
-            states = np.zeros((traj_len, 2, 2))
-            states[:,0,:] = 1 + 0.1*np.random.randn(traj_len, 2)
-            states[:,1,:] = 2 + 0.1*np.random.randn(traj_len, 2)
-            actions = np.repeat((states[:,0,0] + states[:,1,0]).reshape(-1,1), repeats=2, axis=1) 
+            # Store states as a dictionary
+            position = 1 + 0.1*np.random.randn(traj_len, 2)
+            velocity = 2 + 0.1*np.random.randn(traj_len, 2)
+            actions = np.repeat((position[:,0] + velocity[:,0]).reshape(-1,1), repeats=2, axis=1) 
             self.trajectories.append({
-                'observations': states,
+                'observations': {
+                    'position': position,
+                    'velocity': velocity
+                },
                 'actions': actions,
             })
 
         # calculate min len of traj, state mean and variance 
         # and returns_to_go for all traj
         min_len = 10**6
-        states = []
+        states_dict = {name: [] for name in self.state_token_names}
         for traj in self.trajectories:
-            traj_len = traj['observations'].shape[0]
+            traj_len = traj['observations']['position'].shape[0]
             min_len = min(min_len, traj_len)
-            states.append(traj['observations'])
+            for name in self.state_token_names:
+                states_dict[name].append(traj['observations'][name])
 
-        # used for input normalization
-        states = np.concatenate(states, axis=0)
-        self.state_mean, self.state_std = np.mean(states, axis=0), np.std(states, axis=0) + 1e-6
+        # used for input normalization - compute mean/std for each token separately
+        self.state_mean = {}
+        self.state_std = {}
+        for name in self.state_token_names:
+            states_concat = np.concatenate(states_dict[name], axis=0)
+            self.state_mean[name] = np.mean(states_concat, axis=0)
+            self.state_std[name] = np.std(states_concat, axis=0) + 1e-6
+        
         print(f"State mean: {self.state_mean}, State std: {self.state_std}")
+        
         # normalize states
         for traj in self.trajectories:
-            traj['observations'] = (traj['observations'] - self.state_mean) / self.state_std
+            for name in self.state_token_names:
+                traj['observations'][name] = (traj['observations'][name] - self.state_mean[name]) / self.state_std[name]
 
 
 class ToyDatasetPositionEstimator(TrajectoryDataset):
     """
     Toy dataset for testing position estimator.
-    states[:,0] is a 2D velocity vector
-    states[:,1] is a 2D random vector
+    velocity token is a 2D velocity vector
+    noise token is a 2D random vector
     actions are the positions, starting from (0,0) for each trajectory,
     obtained by integrating the velocity vectors.
     """
@@ -198,18 +242,18 @@ class ToyDatasetPositionEstimator(TrajectoryDataset):
     def _setup_dataset(self, dataset_config):
         # Create toy data for position estimation
         self.state_token_dims = [2, 2]
+        self.state_token_names = ['velocity', 'noise']
         self.act_dim = 2
 
         self.trajectories = []
-        for _ in range(100000):
+        for _ in range(10000):
             traj_len = random.randint(10, 50)
-            states = np.zeros((traj_len, 2, 2))
             
-            # states[:,0] is a 2D velocity vector (with some noise)
-            states[:,0,:] = 0.5 + 0.2*np.random.randn(traj_len, 2)
+            # velocity is a 2D velocity vector (with some noise)
+            velocity = 0.5 + 0.2*np.random.randn(traj_len, 2)
             
-            # states[:,1] is a 2D random vector
-            states[:,1,:] = np.random.randn(traj_len, 2)
+            # noise is a 2D random vector
+            noise = np.random.randn(traj_len, 2)
             
             # actions are positions obtained by integrating velocity
             # Starting from (0, 0) for each trajectory
@@ -217,30 +261,40 @@ class ToyDatasetPositionEstimator(TrajectoryDataset):
             positions[0] = np.array([0.0, 0.0])
             for t in range(1, traj_len):
                 # Integrate velocity to get position (simple Euler integration)
-                positions[t] = positions[t-1] + states[t-1, 0, :]
+                positions[t] = positions[t-1] + velocity[t-1, :]
             
             self.trajectories.append({
-                'observations': states,
+                'observations': {
+                    'velocity': velocity,
+                    'noise': noise
+                },
                 'actions': positions,
             })
 
         # calculate min len of traj, state mean and variance 
         # and returns_to_go for all traj
         min_len = 10**6
-        states = []
+        states_dict = {name: [] for name in self.state_token_names}
         for traj in self.trajectories:
-            traj_len = traj['observations'].shape[0]
+            traj_len = traj['observations']['velocity'].shape[0]
             min_len = min(min_len, traj_len)
-            states.append(traj['observations'])
+            for name in self.state_token_names:
+                states_dict[name].append(traj['observations'][name])
 
-        # used for input normalization
-        states = np.concatenate(states, axis=0)
-        self.state_mean, self.state_std = np.mean(states, axis=0), np.std(states, axis=0) + 1e-6
+        # used for input normalization - compute mean/std for each token separately
+        self.state_mean = {}
+        self.state_std = {}
+        for name in self.state_token_names:
+            states_concat = np.concatenate(states_dict[name], axis=0)
+            self.state_mean[name] = np.mean(states_concat, axis=0)
+            self.state_std[name] = np.std(states_concat, axis=0) + 1e-6
+        
         print(f"State mean: {self.state_mean}, State std: {self.state_std}")
         
         # normalize states
         for traj in self.trajectories:
-            traj['observations'] = (traj['observations'] - self.state_mean) / self.state_std
+            for name in self.state_token_names:
+                traj['observations'][name] = (traj['observations'][name] - self.state_mean[name]) / self.state_std[name]
 
 
 
