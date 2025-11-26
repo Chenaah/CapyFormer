@@ -51,7 +51,8 @@ class Trainer():
                 warmup_steps: int = 10000,
                 seed: int = 0,
                 validation_freq: int = 100,
-                validation_trajectories: int = 10):
+                validation_trajectories: int = 10,
+                action_is_velocity: bool = True):
 
         self.traj_dataset = dataset
         self.act_dim = dataset.act_dim
@@ -74,6 +75,7 @@ class Trainer():
         self.seed = seed
         self.validation_freq = validation_freq
         self.validation_trajectories = validation_trajectories
+        self.action_is_velocity = action_is_velocity
 
     def validate_rollout(self, model, device):
         """
@@ -185,27 +187,61 @@ class Trainer():
                     
                     # Plot 2D trajectories if action dimension is 2
                     plot_position = True
-                    if self.act_dim == 2 and plot_position:
-                        pred_actions_np = predicted_actions.numpy()
-                        actual_actions_np = actual_actions.numpy()
+                    if plot_position:
+                        pred_actions_np = predicted_actions.numpy()[:, :2]
+                        actual_actions_np = actual_actions.numpy()[:, :2]
                         
-                        plt.figure(figsize=(10, 8))
-                        plt.plot(actual_actions_np[:, 0], actual_actions_np[:, 1], 
-                                'b-o', label='Actual Actions', linewidth=2, markersize=4, alpha=0.7)
-                        plt.plot(pred_actions_np[:, 0], pred_actions_np[:, 1], 
-                                'r--s', label='Predicted Actions', linewidth=2, markersize=4, alpha=0.7)
+                        if self.action_is_velocity:
+                            # Actions are velocities - integrate to get positions starting from (0, 0)
+                            pred_positions = np.zeros_like(pred_actions_np)
+                            actual_positions = np.zeros_like(actual_actions_np)
+                            
+                            # Cumulative sum to convert velocities to positions
+                            pred_positions[0] = [0, 0]  # Start at origin
+                            actual_positions[0] = [0, 0]  # Start at origin
+                            for i in range(1, len(pred_actions_np)):
+                                pred_positions[i] = pred_positions[i-1] + pred_actions_np[i-1]
+                                actual_positions[i] = actual_positions[i-1] + actual_actions_np[i-1]
+                            
+                            plt.figure(figsize=(10, 8))
+                            plt.plot(actual_positions[:, 0], actual_positions[:, 1], 
+                                    'b-o', label='Actual Trajectory', linewidth=2, markersize=4, alpha=0.7)
+                            plt.plot(pred_positions[:, 0], pred_positions[:, 1], 
+                                    'r--s', label='Predicted Trajectory', linewidth=2, markersize=4, alpha=0.7)
+                            
+                            # Mark start and end points
+                            plt.plot(0, 0, 'go', markersize=10, label='Start')
+                            plt.plot(actual_positions[-1, 0], actual_positions[-1, 1], 
+                                    'bo', markersize=10, label='Actual End')
+                            plt.plot(pred_positions[-1, 0], pred_positions[-1, 1], 
+                                    'ro', markersize=10, label='Predicted End')
+                            
+                            plt.xlabel('X Position', fontsize=12)
+                            plt.ylabel('Y Position', fontsize=12)
+                            plt.title(f'2D Trajectory Comparison (Traj {traj_idx}, MSE: {mse.item():.6f})', fontsize=14)
+                            plt.legend(fontsize=10)
+                            plt.grid(True, alpha=0.3)
+                            plt.axis('equal')  # Equal aspect ratio for better visualization
+                        else:
+                            # Actions are positions - plot directly
+                            plt.figure(figsize=(10, 8))
+                            plt.plot(actual_actions_np[:, 0], actual_actions_np[:, 1], 
+                                    'b-o', label='Actual Actions', linewidth=2, markersize=4, alpha=0.7)
+                            plt.plot(pred_actions_np[:, 0], pred_actions_np[:, 1], 
+                                    'r--s', label='Predicted Actions', linewidth=2, markersize=4, alpha=0.7)
+                            
+                            # Mark start and end points
+                            plt.plot(actual_actions_np[0, 0], actual_actions_np[0, 1], 
+                                    'go', markersize=10, label='Start')
+                            plt.plot(actual_actions_np[-1, 0], actual_actions_np[-1, 1], 
+                                    'ko', markersize=10, label='End')
+                            
+                            plt.xlabel('Action Dimension 0', fontsize=12)
+                            plt.ylabel('Action Dimension 1', fontsize=12)
+                            plt.title(f'2D Trajectory Comparison (Traj {traj_idx}, MSE: {mse.item():.6f})', fontsize=14)
+                            plt.legend(fontsize=10)
+                            plt.grid(True, alpha=0.3)
                         
-                        # Mark start and end points
-                        plt.plot(actual_actions_np[0, 0], actual_actions_np[0, 1], 
-                                'go', markersize=10, label='Start')
-                        plt.plot(actual_actions_np[-1, 0], actual_actions_np[-1, 1], 
-                                'ko', markersize=10, label='End')
-                        
-                        plt.xlabel('Action Dimension 0', fontsize=12)
-                        plt.ylabel('Action Dimension 1', fontsize=12)
-                        plt.title(f'2D Trajectory Comparison (Traj {traj_idx}, MSE: {mse.item():.6f})', fontsize=14)
-                        plt.legend(fontsize=10)
-                        plt.grid(True, alpha=0.3)
                         plt.tight_layout()
                         
                         # Save figure

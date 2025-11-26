@@ -17,6 +17,9 @@ from torch.utils.data import Dataset
 import imageio
 from tqdm import tqdm, trange
 
+# from convert_position_frame import convert_positions_to_imu_frame, normalize_trajectory_positions
+# from load_trajectories import load_trajectories
+
 def save_rollout(rollout, save_dir, file_name="rolloutN.npz"):
     # Convert (T,B,D) to (T*B, D)
     # The observation returned for the i-th environment when done[i] is true will in fact be the first observation of the next episode
@@ -64,19 +67,170 @@ def save_rollout(rollout, save_dir, file_name="rolloutN.npz"):
 class TrajectoryDataset(Dataset):
     context_len: int
     state_token_dims: list
+    state_token_names: list
     act_dim: int
 
     def __init__(self, dataset_config, context_len):
         self.context_len = context_len
-
+        
+        # Subclass should populate trajectories
         self._setup_dataset(dataset_config)
+        
+        # Parent class infers dataset properties from trajectories
+        self._infer_dataset_properties()
+        
+        # Parent class handles normalization and validation
+        self._compute_normalization_stats()
+        self._normalize_trajectories()
+        self._validate_dataset()
 
     def _setup_dataset(self, dataset_config):
         """
         Load the dataset from the given path.
-        This method should be implemented in subclasses.
+        Subclasses should implement this method and populate:
+        - self.trajectories: list of dicts with 'observations' and 'actions'
+        
+        The parent class will automatically infer:
+        - self.state_token_dims: list of dimensions for each state token
+        - self.state_token_names: list of names for each state token (for dict format)
+        - self.act_dim: dimension of action space
+        
+        Note: Subclasses can optionally set these properties manually if needed
+        (e.g., for backwards compatibility or special cases).
         """
         raise NotImplementedError("Subclasses should implement this method.")
+    
+    def _infer_dataset_properties(self):
+        """
+        Infer dataset properties from trajectories.
+        Only infers properties that haven't been manually set by subclass.
+        """
+        if len(self.trajectories) == 0:
+            raise ValueError("No trajectories found in dataset. Cannot infer properties.")
+        
+        # Get first trajectory as reference
+        first_traj = self.trajectories[0]
+        
+        # Infer act_dim if not already set
+        if not hasattr(self, 'act_dim') or self.act_dim is None:
+            self.act_dim = first_traj['actions'].shape[-1]
+        
+        # Check if using dictionary format
+        is_dict_format = isinstance(first_traj['observations'], dict)
+        
+        if is_dict_format:
+            # Dictionary format: infer from keys and shapes
+            if not hasattr(self, 'state_token_names') or self.state_token_names is None:
+                self.state_token_names = list(first_traj['observations'].keys())
+            
+            if not hasattr(self, 'state_token_dims') or self.state_token_dims is None:
+                self.state_token_dims = [
+                    first_traj['observations'][name].shape[-1] 
+                    for name in self.state_token_names
+                ]
+        else:
+            # Legacy tensor format: infer from shape
+            if not hasattr(self, 'state_token_dims') or self.state_token_dims is None:
+                obs_shape = first_traj['observations'].shape
+                if len(obs_shape) == 2:
+                    # Shape is (T, state_dim) - single token
+                    self.state_token_dims = [obs_shape[-1]]
+                elif len(obs_shape) == 3:
+                    # Shape is (T, num_tokens, token_dim) - multiple tokens
+                    num_tokens = obs_shape[1]
+                    token_dim = obs_shape[2]
+                    self.state_token_dims = [token_dim] * num_tokens
+                else:
+                    raise ValueError(f"Unexpected observation shape: {obs_shape}")
+            
+            # Legacy format doesn't have token names
+            if not hasattr(self, 'state_token_names') or self.state_token_names is None:
+                self.state_token_names = None
+    
+    def _compute_normalization_stats(self):
+        """
+        Compute normalization statistics for the dataset.
+        Handles both dictionary and legacy tensor formats.
+        """
+        if len(self.trajectories) == 0:
+            raise ValueError("No trajectories found in dataset")
+        
+        # Check if using dictionary format
+        is_dict_format = isinstance(self.trajectories[0]['observations'], dict)
+        
+        if is_dict_format:
+            # Dictionary format: compute stats for each token separately
+            states_dict = {name: [] for name in self.state_token_names}
+            for traj in self.trajectories:
+                for name in self.state_token_names:
+                    states_dict[name].append(traj['observations'][name])
+            
+            self.state_mean = {}
+            self.state_std = {}
+            for name in self.state_token_names:
+                states_concat = np.concatenate(states_dict[name], axis=0)
+                self.state_mean[name] = np.mean(states_concat, axis=0)
+                self.state_std[name] = np.std(states_concat, axis=0) + 1e-6
+        else:
+            # Legacy tensor format
+            states = []
+            for traj in self.trajectories:
+                states.append(traj['observations'])
+            
+            states = np.concatenate(states, axis=0)
+            self.state_mean = np.mean(states, axis=0)
+            self.state_std = np.std(states, axis=0) + 1e-6
+        
+        print(f"State mean: {self.state_mean}")
+        print(f"State std: {self.state_std}")
+    
+    def _normalize_trajectories(self):
+        """
+        Normalize all trajectories using computed statistics.
+        """
+        is_dict_format = isinstance(self.trajectories[0]['observations'], dict)
+        
+        if is_dict_format:
+            # Dictionary format: normalize each token separately
+            for traj in self.trajectories:
+                for name in self.state_token_names:
+                    traj['observations'][name] = (traj['observations'][name] - self.state_mean[name]) / self.state_std[name]
+        else:
+            # Legacy tensor format
+            for traj in self.trajectories:
+                traj['observations'] = (traj['observations'] - self.state_mean) / self.state_std
+    
+    def _validate_dataset(self):
+        """
+        Validate the dataset structure and check for common issues.
+        """
+        if len(self.trajectories) == 0:
+            raise ValueError("No trajectories in dataset")
+        
+        # Check if using dictionary format
+        is_dict_format = isinstance(self.trajectories[0]['observations'], dict)
+        
+        if is_dict_format:
+            # Validate dictionary format
+            if not hasattr(self, 'state_token_names') or self.state_token_names is None:
+                raise ValueError("state_token_names must be set for dictionary format")
+            
+            if len(self.state_token_names) != len(self.state_token_dims):
+                raise ValueError(f"Length of state_token_names ({len(self.state_token_names)}) must match "
+                               f"state_token_dims ({len(self.state_token_dims)})")
+            
+            # Check all trajectories have the same keys
+            expected_keys = set(self.state_token_names)
+            for i, traj in enumerate(self.trajectories):
+                actual_keys = set(traj['observations'].keys())
+                if actual_keys != expected_keys:
+                    raise ValueError(f"Trajectory {i} has keys {actual_keys}, expected {expected_keys}")
+        
+        print(f"Dataset validation passed: {len(self.trajectories)} trajectories loaded")
+        print(f"  State token dims: {self.state_token_dims}")
+        if is_dict_format:
+            print(f"  State token names: {self.state_token_names}")
+        print(f"  Action dim: {self.act_dim}")
 
 
 
@@ -184,13 +338,11 @@ class TrajectoryDataset(Dataset):
 class ToyDataset(TrajectoryDataset):
 
     def _setup_dataset(self, dataset_config):
-        # Create some toy data
-        self.state_token_dims = [2, 2]
-        self.state_token_names = ['position', 'velocity']
-        self.act_dim = 2
-
+        # Create trajectories - parent class will infer properties automatically
         self.trajectories = []
-        for _ in range(100):
+        num_trajectories = dataset_config.get('num_trajectories', 100)
+        
+        for _ in range(num_trajectories):
             traj_len = random.randint(10, 50)
             # Store states as a dictionary
             position = 1 + 0.1*np.random.randn(traj_len, 2)
@@ -204,31 +356,6 @@ class ToyDataset(TrajectoryDataset):
                 'actions': actions,
             })
 
-        # calculate min len of traj, state mean and variance 
-        # and returns_to_go for all traj
-        min_len = 10**6
-        states_dict = {name: [] for name in self.state_token_names}
-        for traj in self.trajectories:
-            traj_len = traj['observations']['position'].shape[0]
-            min_len = min(min_len, traj_len)
-            for name in self.state_token_names:
-                states_dict[name].append(traj['observations'][name])
-
-        # used for input normalization - compute mean/std for each token separately
-        self.state_mean = {}
-        self.state_std = {}
-        for name in self.state_token_names:
-            states_concat = np.concatenate(states_dict[name], axis=0)
-            self.state_mean[name] = np.mean(states_concat, axis=0)
-            self.state_std[name] = np.std(states_concat, axis=0) + 1e-6
-        
-        print(f"State mean: {self.state_mean}, State std: {self.state_std}")
-        
-        # normalize states
-        for traj in self.trajectories:
-            for name in self.state_token_names:
-                traj['observations'][name] = (traj['observations'][name] - self.state_mean[name]) / self.state_std[name]
-
 
 class ToyDatasetPositionEstimator(TrajectoryDataset):
     """
@@ -240,13 +367,11 @@ class ToyDatasetPositionEstimator(TrajectoryDataset):
     """
 
     def _setup_dataset(self, dataset_config):
-        # Create toy data for position estimation
-        self.state_token_dims = [2, 2]
-        self.state_token_names = ['velocity', 'noise']
-        self.act_dim = 2
-
+        # Create trajectories - parent class will infer properties automatically
         self.trajectories = []
-        for _ in range(10000):
+        num_trajectories = dataset_config.get('num_trajectories', 10000)
+        
+        for _ in range(num_trajectories):
             traj_len = random.randint(10, 50)
             
             # velocity is a 2D velocity vector (with some noise)
@@ -270,31 +395,6 @@ class ToyDatasetPositionEstimator(TrajectoryDataset):
                 },
                 'actions': positions,
             })
-
-        # calculate min len of traj, state mean and variance 
-        # and returns_to_go for all traj
-        min_len = 10**6
-        states_dict = {name: [] for name in self.state_token_names}
-        for traj in self.trajectories:
-            traj_len = traj['observations']['velocity'].shape[0]
-            min_len = min(min_len, traj_len)
-            for name in self.state_token_names:
-                states_dict[name].append(traj['observations'][name])
-
-        # used for input normalization - compute mean/std for each token separately
-        self.state_mean = {}
-        self.state_std = {}
-        for name in self.state_token_names:
-            states_concat = np.concatenate(states_dict[name], axis=0)
-            self.state_mean[name] = np.mean(states_concat, axis=0)
-            self.state_std[name] = np.std(states_concat, axis=0) + 1e-6
-        
-        print(f"State mean: {self.state_mean}, State std: {self.state_std}")
-        
-        # normalize states
-        for traj in self.trajectories:
-            for name in self.state_token_names:
-                traj['observations'][name] = (traj['observations'][name] - self.state_mean[name]) / self.state_std[name]
 
 
 
