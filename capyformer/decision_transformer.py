@@ -52,7 +52,8 @@ class Trainer():
                 seed: int = 0,
                 validation_freq: int = 100,
                 validation_trajectories: int = 10,
-                action_is_velocity: bool = True):
+                action_is_velocity: bool = True,
+                dt: float = 0.02):
 
         self.traj_dataset = dataset
         self.act_dim = dataset.act_dim
@@ -76,6 +77,7 @@ class Trainer():
         self.validation_freq = validation_freq
         self.validation_trajectories = validation_trajectories
         self.action_is_velocity = action_is_velocity
+        self.dt = dt
 
         if not os.path.exists(self.log_dir):
             os.makedirs(self.log_dir)
@@ -205,8 +207,8 @@ class Trainer():
                             pred_positions[0] = [0, 0]  # Start at origin
                             actual_positions[0] = [0, 0]  # Start at origin
                             for i in range(1, len(pred_actions_np)):
-                                pred_positions[i] = pred_positions[i-1] + pred_actions_np[i-1]
-                                actual_positions[i] = actual_positions[i-1] + actual_actions_np[i-1]
+                                pred_positions[i] = pred_positions[i-1] + pred_actions_np[i-1] * self.dt
+                                actual_positions[i] = actual_positions[i-1] + actual_actions_np[i-1] * self.dt
                             
                             plt.figure(figsize=(10, 8))
                             plt.plot(actual_positions[:, 0], actual_positions[:, 1], 
