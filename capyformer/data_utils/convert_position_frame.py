@@ -242,14 +242,8 @@ def calculate_velocity_from_position(trajectories, position_key='position_imu_fr
         velocities = np.zeros_like(positions)
         
         # Central differences for interior points
-        for i in range(1, len(positions) - 1):
-            velocities[i] = (positions[i+1] - positions[i-1]) / (2 * dt)
-        
-        # Forward difference for first point
-        velocities[0] = (positions[1] - positions[0]) / dt
-        
-        # Backward difference for last point
-        velocities[-1] = (positions[-1] - positions[-2]) / dt
+        for i in range(1, len(positions)):
+            velocities[i] = (positions[i] - positions[i-1]) / (dt)
         
         # Calculate speed (magnitude of velocity)
         speeds = np.linalg.norm(velocities, axis=1)

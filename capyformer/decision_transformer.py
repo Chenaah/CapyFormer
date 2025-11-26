@@ -77,6 +77,9 @@ class Trainer():
         self.validation_trajectories = validation_trajectories
         self.action_is_velocity = action_is_velocity
 
+        if not os.path.exists(self.log_dir):
+            os.makedirs(self.log_dir)
+
     def validate_rollout(self, model, device):
         """
         Validate the model by performing trajectory rollouts.
@@ -109,6 +112,8 @@ class Trainer():
                     traj_len = traj['observations'][first_key].shape[0]
                 else:
                     traj_len = traj['observations'].shape[0]
+
+                traj_len = min(traj_len, 200)  # Limit length for validation speed
                     
                 if traj_len < 2:
                     continue

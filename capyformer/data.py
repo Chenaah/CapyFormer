@@ -17,6 +17,7 @@ from torch.utils.data import Dataset
 import imageio
 from tqdm import tqdm, trange
 
+
 # from convert_position_frame import convert_positions_to_imu_frame, normalize_trajectory_positions
 # from load_trajectories import load_trajectories
 
@@ -394,6 +395,45 @@ class ToyDatasetPositionEstimator(TrajectoryDataset):
                     'noise': noise
                 },
                 'actions': positions,
+            })
+
+
+class ToyDatasetVelocityEstimator(TrajectoryDataset):
+    """
+    Toy dataset for testing velocity estimator.
+    position token is a 2D position vector
+    noise token is a 2D random vector
+    actions are the velocities obtained by differentiating the positions.
+    """
+
+    def _setup_dataset(self, dataset_config):
+        # Create trajectories - parent class will infer properties automatically
+        self.trajectories = []
+        num_trajectories = dataset_config.get('num_trajectories', 10000)
+        
+        for _ in range(num_trajectories):
+            traj_len = random.randint(10, 50)
+            
+            # velocity is a 2D velocity vector (with some noise)
+            velocity = 0.2 + 0.5*np.random.randn(traj_len, 2)
+            
+            # noise is a 2D random vector
+            noise = np.random.randn(traj_len, 2)
+            
+            # positions obtained by integrating velocity
+            # Starting from (0, 0) for each trajectory
+            positions = np.zeros((traj_len, 2))
+            positions[0] = np.array([0.0, 0.0])
+            for t in range(1, traj_len):
+                # Integrate velocity to get position (simple Euler integration)
+                positions[t] = positions[t-1] + velocity[t-1, :]
+            
+            self.trajectories.append({
+                'observations': {
+                    'position': positions,
+                    'noise': noise
+                },
+                'actions': velocity,
             })
 
 
@@ -919,3 +959,52 @@ class QuickDistill(TrajectoryDataset):
         for traj in self.trajectories:
             traj['observations'] = (traj['observations'] - self.state_mean) / self.state_std
 
+
+
+
+
+if __name__ == "__main__":
+    from capyformer.decision_transformer import Trainer
+
+    # Call train with explicit parameters
+    dataset_path_list = glob.glob("./debug/test_dataset/*.npz")
+    context_len=10
+    data_cfg = {"dataset_path": dataset_path_list}
+    traj_dataset = ToyDatasetVelocityEstimator(data_cfg, context_len)
+    
+    dt = Trainer(
+        traj_dataset,
+        log_dir="./debug",
+        use_action_tanh=False,
+        shared_state_embedding=False,
+        n_blocks=3,
+        h_dim=256,
+        n_heads=1,
+        batch_size=32,
+        action_is_velocity=True
+    )
+    dt.learn(
+        n_epochs=10000,
+    )
+
+
+    # dataset_path_list = glob.glob("./debug/test_dataset/*.npz")
+    # context_len=10
+    # data_cfg = {"dataset_path": dataset_path_list}
+    # traj_dataset = ToyDatasetPositionEstimator(data_cfg, context_len)
+    
+    # dt = Trainer(
+    #     traj_dataset,
+    #     log_dir="./debug",
+    #     use_action_tanh=False,
+    #     shared_state_embedding=False,
+    #     n_blocks=3,
+    #     h_dim=256,
+    #     n_heads=1,
+    #     batch_size=32,
+    #     action_is_velocity=False
+    # )
+    # dt.learn(
+    #     n_epochs=10000,
+    # )
+    
