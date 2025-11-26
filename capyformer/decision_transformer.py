@@ -100,9 +100,9 @@ class Trainer():
         with torch.no_grad():
             for _ in range(self.validation_trajectories):
                 # Sample a random trajectory from the dataset
-                traj_idx = random.randint(0, len(self.traj_dataset.trajectories) - 1)
-                traj = self.traj_dataset.trajectories[traj_idx]
-                
+                traj_idx = random.randint(0, len(self.traj_dataset.val_trajectories) - 1)
+                traj = self.traj_dataset.val_trajectories[traj_idx]
+
                 # Check if observations is a dictionary (new format) or array (legacy format)
                 is_dict_format = isinstance(traj['observations'], dict)
                 

@@ -83,6 +83,14 @@ class TrajectoryDataset(Dataset):
         # Parent class handles normalization and validation
         self._compute_normalization_stats()
         self._normalize_trajectories()
+        
+        # Optional: split into train/validation sets
+        self.val_split = dataset_config.get('val_split', None)
+        if self.val_split is not None:
+            self._split_train_val()
+        else:
+            self.val_trajectories = self.trajectories
+        
         self._validate_dataset()
 
     def _setup_dataset(self, dataset_config):
@@ -201,6 +209,60 @@ class TrajectoryDataset(Dataset):
             for traj in self.trajectories:
                 traj['observations'] = (traj['observations'] - self.state_mean) / self.state_std
     
+    def _split_train_val(self):
+        """
+        Split trajectories into training and validation sets.
+        
+        The split can be specified as:
+        - float (0.0-1.0): fraction of trajectories for validation
+        - int: absolute number of trajectories for validation
+        
+        Trajectories are shuffled before splitting to ensure randomness.
+        Results are stored in self.trajectories (train) and self.val_trajectories (val).
+        """
+        if self.val_split is None or self.val_split == 0:
+            self.val_trajectories = []
+            return
+        
+        total_trajs = len(self.trajectories)
+        
+        # Determine number of validation trajectories
+        if isinstance(self.val_split, float):
+            if not (0.0 < self.val_split < 1.0):
+                raise ValueError(f"val_split as float must be between 0 and 1, got {self.val_split}")
+            n_val = int(total_trajs * self.val_split)
+        elif isinstance(self.val_split, int):
+            if not (0 < self.val_split < total_trajs):
+                raise ValueError(f"val_split as int must be between 0 and {total_trajs}, got {self.val_split}")
+            n_val = self.val_split
+        else:
+            raise TypeError(f"val_split must be float or int, got {type(self.val_split)}")
+        
+        # Ensure at least one trajectory in each set
+        if n_val == 0:
+            print(f"Warning: val_split resulted in 0 validation trajectories. Using 1 instead.")
+            n_val = 1
+        if n_val >= total_trajs:
+            print(f"Warning: val_split resulted in {n_val} validation trajectories (>= total). Using {total_trajs-1} instead.")
+            n_val = total_trajs - 1
+        
+        # Shuffle trajectories for random split
+        import random
+        random.seed(42)  # For reproducibility
+        indices = list(range(total_trajs))
+        random.shuffle(indices)
+        
+        # Split indices
+        val_indices = set(indices[:n_val])
+        train_indices = set(indices[n_val:])
+        
+        # Split trajectories
+        self.val_trajectories = [self.trajectories[i] for i in sorted(val_indices)]
+        train_trajectories = [self.trajectories[i] for i in sorted(train_indices)]
+        self.trajectories = train_trajectories
+        
+        print(f"Split dataset: {len(self.trajectories)} training trajectories, {len(self.val_trajectories)} validation trajectories")
+    
     def _validate_dataset(self):
         """
         Validate the dataset structure and check for common issues.
@@ -252,6 +314,21 @@ class TrajectoryDataset(Dataset):
         
         return self.state_mean, self.state_std
 
+    def get_val_dataset(self):
+        """
+        Create and return a validation dataset using the validation trajectories.
+        Returns None if no validation split was configured.
+        
+        The validation dataset shares the same normalization stats as the training set.
+        """
+        if not hasattr(self, 'val_trajectories') or len(self.val_trajectories) == 0:
+            return None
+        
+        # Create a shallow copy of self to use as validation dataset
+        val_dataset = copy.copy(self)
+        val_dataset.trajectories = self.val_trajectories
+        
+        return val_dataset
 
     def __len__(self):
         return len(self.trajectories)
