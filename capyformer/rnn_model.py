@@ -164,7 +164,6 @@ class RNNModel(nn.Module):
         # Concatenate all embedded tokens along the feature dimension
         # Each token is (B, T, h_dim), concatenating gives (B, T, num_tokens * h_dim)
         state_embeddings = torch.cat(embedded_tokens, dim=-1)
-        pdb.set_trace()
         
         # Pass through RNN
         if self.rnn_type == 'LSTM':

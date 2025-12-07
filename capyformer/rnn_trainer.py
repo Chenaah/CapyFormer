@@ -108,26 +108,23 @@ class RNNTrainer:
                 # RNN hidden state (will be updated incrementally)
                 hidden = None
                 
-                # Step-by-step prediction using only available history
-                # This simulates real deployment: at each timestep t, the robot only has
-                # access to observations from 0 to t, and must predict the velocity at t
+                # Step-by-step prediction using incremental inference
+                # At each timestep, we only pass the current state and reuse the hidden state
+                # from the previous step, making inference O(T) instead of O(T^2)
                 for t in range(traj_len):
-                    # Get states from beginning up to current timestep
-                    # In real deployment, we only have access to states[0:t+1]
-                    states_history = {}
+                    # Get only the current state at timestep t
+                    current_state = {}
                     for key, value in states.items():
-                        # Include states from 0 to t (inclusive)
-                        states_history[key] = torch.FloatTensor(value[:t+1]).unsqueeze(0).to(device)  # 1 x (t+1) x dim
+                        # Only include state at timestep t (shape: 1 x 1 x dim)
+                        current_state[key] = torch.FloatTensor(value[t:t+1]).unsqueeze(0).to(device)
                     
-                    # Forward pass through RNN with current history
-                    # Note: We reset hidden=None each time for simplicity in validation
-                    # In production, you could maintain hidden state across steps for efficiency:
-                    # - First step: hidden = None (initialize)
-                    # - Subsequent steps: pass only new state, reuse hidden from previous step
-                    action_preds, hidden = model(states_history, hidden=None)
+                    # Forward pass through RNN with current state and previous hidden
+                    # - First step (t=0): hidden=None initializes the hidden state
+                    # - Subsequent steps: reuse hidden from previous step for efficiency
+                    action_preds, hidden = model(current_state, hidden=hidden)
                     
-                    # Get prediction at the last timestep (current timestep)
-                    pred_action = action_preds[0, -1].cpu().numpy()  # Get last prediction
+                    # Get prediction (only one timestep, so index 0)
+                    pred_action = action_preds[0, 0].cpu().numpy()
                     predicted_actions.append(pred_action)
                 
                 # Convert predictions to tensor for MSE computation
