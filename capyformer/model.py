@@ -14,6 +14,8 @@ which is fixed in the following code
 
 import math
 import pdb
+from typing import Dict, List, Optional, Tuple
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -93,6 +95,11 @@ class Block(nn.Module):
 
 
 class Transformer(nn.Module):
+    # Class attribute annotations for TorchScript
+    state_token_names: List[str]
+    _state_mean_dict: Optional[Dict[str, torch.Tensor]]
+    _state_std_dict: Optional[Dict[str, torch.Tensor]]
+    
     def __init__(self, state_token_dims, act_dim, n_blocks, h_dim, context_len,
                  n_heads, drop_p, max_timestep=4096, state_mean=None, state_std=None,
                  use_action_tanh=False, shared_state_embedding=True, state_token_names=None):
@@ -107,7 +114,7 @@ class Transformer(nn.Module):
         if state_token_names is None:
             # Default names if not provided
             state_token_names = [f"token_{i}" for i in range(len(state_token_dims))]
-        self.state_token_names = state_token_names
+        self.state_token_names: List[str] = state_token_names
         
         # Register as buffer for TorchScript compatibility
         self.register_buffer('state_token_dims', torch.tensor(state_token_dims, dtype=torch.long))
@@ -159,25 +166,49 @@ class Transformer(nn.Module):
             *([nn.Linear(h_dim, act_dim)] + ([nn.Tanh()] if use_action_tanh else []))
         )
 
-        # Handle both dictionary and tensor formats for state_mean and state_std
+        # Handle state_mean and state_std - register as buffers for TorchScript compatibility
+        # Initialize dict versions (for non-JIT use and checkpoint saving)
+        self._state_mean_dict = None
+        self._state_std_dict = None
+        
         if state_mean is not None:
             if isinstance(state_mean, dict):
-                self.state_mean = {key: torch.tensor(value) for key, value in state_mean.items()}
+                # Store dict version for non-JIT use and for checkpoint saving
+                self._state_mean_dict = {
+                    key: torch.as_tensor(value, dtype=torch.float32) for key, value in state_mean.items()
+                }
+                # Register concatenated buffer for TorchScript
+                mean_tensors = [self._state_mean_dict[name] for name in self.state_token_names]
+                self.register_buffer('_state_mean_concat', torch.cat(mean_tensors))
             else:
-                self.state_mean = torch.tensor(state_mean)
+                self.register_buffer('_state_mean_concat', torch.as_tensor(state_mean, dtype=torch.float32))
         else:
-            self.state_mean = None
+            self.register_buffer('_state_mean_concat', torch.zeros(1))  # Dummy buffer
             
         if state_std is not None:
             if isinstance(state_std, dict):
-                self.state_std = {key: torch.tensor(value) for key, value in state_std.items()}
+                self._state_std_dict = {
+                    key: torch.as_tensor(value, dtype=torch.float32) for key, value in state_std.items()
+                }
+                std_tensors = [self._state_std_dict[name] for name in self.state_token_names]
+                self.register_buffer('_state_std_concat', torch.cat(std_tensors))
             else:
-                self.state_std = torch.tensor(state_std)
+                self.register_buffer('_state_std_concat', torch.as_tensor(state_std, dtype=torch.float32))
         else:
-            self.state_std = None
+            self.register_buffer('_state_std_concat', torch.ones(1))  # Dummy buffer
+    
+    @property
+    def state_mean(self) -> Optional[Dict[str, torch.Tensor]]:
+        """Return state_mean as dict for backward compatibility."""
+        return self._state_mean_dict
+    
+    @property  
+    def state_std(self) -> Optional[Dict[str, torch.Tensor]]:
+        """Return state_std as dict for backward compatibility."""
+        return self._state_std_dict
 
 
-    def forward(self, timesteps, states, actions):
+    def forward(self, timesteps: torch.Tensor, states: Dict[str, torch.Tensor], actions: torch.Tensor) -> Tuple[Optional[torch.Tensor], torch.Tensor, Optional[torch.Tensor]]:
         """
         Forward pass of the Decision Transformer.
         
@@ -187,14 +218,6 @@ class Transformer(nn.Module):
                    and values are tensors of shape (B, T, token_dim) where token_dim can vary per token
             actions: Tensor of shape (B, T, act_dim)
         """
-        
-        # Check if states is a dictionary
-        if not isinstance(states, dict):
-            raise ValueError("states must be a dictionary with state token names as keys")
-        
-        # Verify all expected state tokens are present
-        if set(states.keys()) != set(self.state_token_names):
-            raise ValueError(f"Expected state keys {self.state_token_names}, got {list(states.keys())}")
         
         # Get batch size and sequence length from the first state token
         first_token = states[self.state_token_names[0]]
@@ -206,7 +229,7 @@ class Transformer(nn.Module):
         action_embeddings = self.embed_action(actions) + time_embeddings
 
         # Process each state token
-        state_embeddings = []
+        state_embeddings: List[torch.Tensor] = []
         if self.shared_state_embedding:
             # Use shared embedding for all tokens
             for token_name in self.state_token_names:
@@ -214,16 +237,16 @@ class Transformer(nn.Module):
                 embedding = self.shared_state_embed(state_token) + time_embeddings
                 state_embeddings.append(embedding)
         else:
-            # Use separate embeddings
-            for token_name in self.state_token_names:
+            # Use separate embeddings - enumerate ModuleDict for TorchScript compatibility
+            for token_name, embed_layer in self.state_embedding_layers.items():
                 state_token = states[token_name]  # (B, T, token_dim)
-                embedding = self.state_embedding_layers[token_name](state_token) + time_embeddings
+                embedding = embed_layer(state_token) + time_embeddings
                 state_embeddings.append(embedding)
         
         # Stack all embeddings: state tokens + action token
-        h = torch.stack(
-            state_embeddings + [action_embeddings], dim=1
-        ).permute(0, 2, 1, 3).reshape(B, len(state_embeddings + [action_embeddings]) * T, self.h_dim)
+        state_embeddings.append(action_embeddings)
+        num_tokens = len(state_embeddings)
+        h = torch.stack(state_embeddings, dim=1).permute(0, 2, 1, 3).reshape(B, num_tokens * T, self.h_dim)
 
         h = self.embed_ln(h)
 
@@ -274,7 +297,251 @@ class Transformer(nn.Module):
         self.state_embedding_layers = nn.ModuleList()
         for dim in self.state_token_dims:
             self.state_embedding_layers.append(nn.Linear(dim, self.h_dim))
+    
+    def get_inference(self, device: str = None, context_len: int = None) -> 'TransformerInference':
+        """
+        Create an inference wrapper for easy step-by-step prediction.
+        
+        The inference wrapper handles context window management automatically,
+        so you can simply feed in the current state at each timestep.
+        
+        Args:
+            device: Device to run inference on ('cpu' or 'cuda'). 
+                   If None, uses the device of the model's parameters.
+            context_len: Context length. If None, inferred from model architecture.
+        
+        Returns:
+            TransformerInference instance
+        
+        Example:
+            model = Transformer(...)
+            model.load_state_dict(torch.load('model.pt'))
+            
+            inference = model.get_inference(device='cuda')
+            
+            for t in range(episode_length):
+                state = {'position': pos, 'velocity': vel}
+                prediction = inference.step(state)
+                # use prediction...
+            
+            inference.reset()  # for new episode
+        """
+        if device is None:
+            # Get device from model parameters
+            device = next(self.parameters()).device
+        
+        return TransformerInference(self, device=str(device), context_len=context_len)
 
+
+class TransformerInference:
+    """
+    Inference wrapper for Transformer that automatically manages state/action history.
+    
+    This class handles the context window management so you can simply feed in
+    the current state at each timestep and get the predicted output.
+    
+    Note: This wrapper automatically normalizes input states using the model's
+    stored normalization statistics. Predictions are returned in the original
+    (un-normalized) scale since targets are not normalized during training.
+    
+    Example usage:
+        # Load trained model
+        model = Transformer(...)
+        model.load_state_dict(torch.load('model.pt'))
+        
+        # Create inference wrapper
+        inference = TransformerInference(model, device='cuda')
+        
+        # At each timestep, just call step() with current state
+        for t in range(episode_length):
+            current_state = {
+                'position': get_position(),  # numpy array or tensor of shape (dim,)
+                'velocity': get_velocity(),
+            }
+            predicted_output = inference.step(current_state)
+            
+            # Use predicted_output for control...
+            
+        # Reset for new episode
+        inference.reset()
+    """
+    
+    def __init__(self, model: Transformer, device: str = 'cpu', context_len: int = None):
+        """
+        Initialize the inference wrapper.
+        
+        Args:
+            model: Trained Transformer model
+            device: Device to run inference on ('cpu' or 'cuda')
+            context_len: Context length (if None, inferred from model)
+        """
+        self.model = model
+        self.device = device
+        self.model.to(device)
+        self.model.eval()
+        
+        # Get model configuration
+        self.state_token_names = model.state_token_names
+        self.state_token_dims = [int(d.item()) for d in model.state_token_dims]
+        self.act_dim = model.act_dim
+        
+        # Get normalization statistics from model
+        self.state_mean = model.state_mean  # Dict[str, Tensor] or None
+        self.state_std = model.state_std    # Dict[str, Tensor] or None
+        
+        # Infer context length from model's transformer block
+        if context_len is not None:
+            self.context_len = context_len
+        else:
+            # Try to infer from the attention mask size
+            # input_seq_len = (num_state_tokens + 1) * context_len
+            num_tokens = model.num_state_tokens + 1
+            input_seq_len = model.transformer[0].attention.max_T
+            self.context_len = input_seq_len // num_tokens
+        
+        # Initialize history buffers
+        self.reset()
+    
+    def reset(self):
+        """Reset the history buffers for a new episode."""
+        self.timestep = 0
+        
+        # Initialize state history as dict of lists
+        self.state_history = {
+            name: [] for name in self.state_token_names
+        }
+        
+        # Initialize action history (predictions)
+        self.action_history = []
+    
+    def _normalize_state(self, name: str, value: torch.Tensor) -> torch.Tensor:
+        """
+        Normalize a state tensor using stored statistics.
+        
+        Args:
+            name: State token name
+            value: Raw state tensor
+            
+        Returns:
+            Normalized state tensor
+        """
+        if self.state_mean is not None and self.state_std is not None:
+            if name in self.state_mean and name in self.state_std:
+                mean = self.state_mean[name]
+                std = self.state_std[name]
+                
+                # Move to same device as value if needed
+                if mean.device != value.device:
+                    mean = mean.to(value.device)
+                    std = std.to(value.device)
+                
+                return (value - mean) / std
+        
+        # No normalization available
+        return value
+    
+    def _prepare_context(self):
+        """Prepare the context tensors for model forward pass."""
+        # Determine how many timesteps we have
+        n_steps = len(self.action_history) + 1  # +1 for current state without action yet
+        context_steps = min(n_steps, self.context_len)
+        
+        # Prepare states dict
+        states = {}
+        for name in self.state_token_names:
+            # Get last context_steps states
+            state_list = self.state_history[name][-context_steps:]
+            # Stack and add batch dimension: (context_steps, dim) -> (1, context_steps, dim)
+            states[name] = torch.stack(state_list, dim=0).unsqueeze(0).to(self.device)
+        
+        # Prepare actions - pad with zeros for current timestep (we don't have action yet)
+        if len(self.action_history) >= context_steps:
+            actions_list = self.action_history[-(context_steps):]
+        else:
+            actions_list = self.action_history.copy()
+        
+        # Pad actions to match state length (add zero action for current timestep)
+        while len(actions_list) < context_steps:
+            actions_list.append(torch.zeros(self.act_dim))
+        
+        actions = torch.stack(actions_list, dim=0).unsqueeze(0).to(self.device)
+        
+        # Prepare timesteps
+        start_t = max(0, self.timestep - context_steps + 1)
+        timesteps = torch.arange(start_t, start_t + context_steps, dtype=torch.long)
+        timesteps = timesteps.unsqueeze(0).to(self.device)
+        
+        return timesteps, states, actions, context_steps
+    
+    @torch.no_grad()
+    def step(self, current_state: dict, return_numpy: bool = True):
+        """
+        Process current state and return predicted output.
+        
+        Args:
+            current_state: Dictionary mapping state token names to their values.
+                          Values can be numpy arrays or tensors of shape (dim,).
+            return_numpy: If True, return numpy array; otherwise return tensor.
+        
+        Returns:
+            Predicted output (e.g., action, velocity, position) as numpy array or tensor
+            of shape (target_dim,)
+        """
+        # Convert current state to tensors, normalize, and add to history
+        for name in self.state_token_names:
+            if name not in current_state:
+                raise ValueError(f"Missing state token '{name}' in current_state. "
+                               f"Expected keys: {self.state_token_names}")
+            
+            value = current_state[name]
+            if isinstance(value, np.ndarray):
+                value = torch.from_numpy(value).float()
+            elif not isinstance(value, torch.Tensor):
+                value = torch.tensor(value, dtype=torch.float32)
+            
+            # Normalize the input state
+            value = self._normalize_state(name, value)
+            
+            self.state_history[name].append(value)
+        
+        # Prepare context for model
+        timesteps, states, actions, context_steps = self._prepare_context()
+        
+        # Forward pass
+        _, action_preds, _ = self.model.forward(timesteps, states, actions)
+        
+        # Get prediction for current timestep (last position in sequence)
+        predicted = action_preds[0, -1]  # Remove batch dim, get last timestep
+        
+        # Store predicted action in history for next step
+        self.action_history.append(predicted.cpu())
+        
+        # Increment timestep
+        self.timestep += 1
+        
+        # Trim history to avoid memory growth (keep 2x context_len for safety)
+        max_history = self.context_len * 2
+        if len(self.action_history) > max_history:
+            self.action_history = self.action_history[-max_history:]
+            for name in self.state_token_names:
+                self.state_history[name] = self.state_history[name][-max_history:]
+        
+        if return_numpy:
+            return predicted.cpu().numpy()
+        return predicted
+    
+    def get_history(self):
+        """
+        Get the full history of states and predictions.
+        
+        Returns:
+            dict with 'states' (dict of lists) and 'actions' (list of tensors)
+        """
+        return {
+            'states': {name: [s.numpy() for s in states] 
+                      for name, states in self.state_history.items()},
+            'actions': [a.numpy() for a in self.action_history]
+        }
 
 
 if __name__ == "__main__":
@@ -313,6 +580,50 @@ if __name__ == "__main__":
     )
 
     print(out[1].shape)
+
+    # ============================================
+    # Example: Using TransformerInference wrapper
+    # ============================================
+    print("\n--- TransformerInference Example ---")
+    
+    # Create a simple model for inference demo
+    inference_model = Transformer(
+        state_token_dims=[2, 2],  # position and velocity, each 2D
+        state_token_names=['position', 'velocity'],
+        act_dim=2,
+        n_blocks=1,
+        h_dim=64,
+        context_len=10,
+        n_heads=1,
+        drop_p=0.0,
+        shared_state_embedding=False
+    )
+    
+    # Get inference wrapper directly from model - much cleaner!
+    inference = inference_model.get_inference(device='cpu')
+    
+    # Simulate a few timesteps of inference
+    print(f"Context length: {inference.context_len}")
+    print(f"State token names: {inference.state_token_names}")
+    
+    for t in range(15):
+        # Simulate getting current state (e.g., from sensors)
+        current_state = {
+            'position': np.random.randn(2),  # Can use numpy arrays
+            'velocity': np.random.randn(2),
+        }
+        
+        # Get prediction - history is managed automatically!
+        prediction = inference.step(current_state)
+        
+        if t < 3 or t >= 13:
+            print(f"  t={t}: prediction shape = {prediction.shape}, value = {prediction}")
+        elif t == 3:
+            print("  ...")
+    
+    # Reset for new episode
+    inference.reset()
+    print("Reset for new episode - history cleared")
 
 
     # model2 = DecisionTransformerOld(

@@ -1,6 +1,5 @@
 import copy
 from typing import Tuple
-import ray
 from collections import defaultdict
 import glob
 import multiprocessing
@@ -9,12 +8,10 @@ import pdb
 import random
 import time
 import pickle
-from regex import F
 import torch
 import numpy as np
 from torch.utils.data import Dataset
 # from d4rl_infos import REF_MIN_SCORE, REF_MAX_SCORE, D4RL_DATASET_STATS
-import imageio
 from tqdm import tqdm, trange
 
 
@@ -66,16 +63,65 @@ def save_rollout(rollout, save_dir, file_name="rolloutN.npz"):
 
 
 class TrajectoryDataset(Dataset):
+    """
+    Base class for trajectory datasets.
+    
+    Trajectories can be stored in two formats:
+    
+    1. New flat format (recommended):
+       Each trajectory is a dict with arbitrary keys, each mapping to a (T, dim) array.
+       Use `target_key` in dataset_config to specify which key is the prediction target.
+       All other keys are treated as input observations.
+       
+       Example:
+       ```
+       trajectory = {
+           'position': np.array of shape (T, 2),    # input
+           'velocity': np.array of shape (T, 2),    # input  
+           'acceleration': np.array of shape (T, 2) # target (to be predicted)
+       }
+       dataset_config = {'target_key': 'acceleration'}
+       ```
+    
+    2. Legacy format (for backward compatibility):
+       Each trajectory has 'observations' (dict or array) and 'actions' keys.
+       'observations' contains input data, 'actions' is the prediction target.
+       
+       Example:
+       ```
+       trajectory = {
+           'observations': {'position': ..., 'velocity': ...},
+           'actions': np.array of shape (T, act_dim)
+       }
+       ```
+    
+    Properties:
+        input_token_names: list of input token names (keys)
+        input_token_dims: list of dimensions for each input token
+        target_dim: dimension of the target (prediction output)
+        
+    For backward compatibility, these aliases are also available:
+        state_token_names -> input_token_names
+        state_token_dims -> input_token_dims
+        act_dim -> target_dim
+    """
     context_len: int
-    state_token_dims: list
-    state_token_names: list
-    act_dim: int
+    input_token_dims: list
+    input_token_names: list
+    target_dim: int
+    target_key: str
 
     def __init__(self, dataset_config, context_len):
         self.context_len = context_len
         
+        # Get target key from config (defaults to 'actions' for legacy format)
+        self.target_key = dataset_config.get('target_key', None)
+        
         # Subclass should populate trajectories
         self._setup_dataset(dataset_config)
+        
+        # Detect and convert format if needed
+        self._detect_and_normalize_format()
         
         # Parent class infers dataset properties from trajectories
         self._infer_dataset_properties()
@@ -92,22 +138,122 @@ class TrajectoryDataset(Dataset):
             self.val_trajectories = self.trajectories
         
         self._validate_dataset()
+    
+    # Backward compatibility properties
+    @property
+    def state_token_names(self):
+        return self.input_token_names
+    
+    @state_token_names.setter
+    def state_token_names(self, value):
+        self.input_token_names = value
+    
+    @property
+    def state_token_dims(self):
+        return self.input_token_dims
+    
+    @state_token_dims.setter
+    def state_token_dims(self, value):
+        self.input_token_dims = value
+    
+    @property
+    def act_dim(self):
+        return self.target_dim
+    
+    @act_dim.setter
+    def act_dim(self, value):
+        self.target_dim = value
 
     def _setup_dataset(self, dataset_config):
         """
         Load the dataset from the given path.
         Subclasses should implement this method and populate:
-        - self.trajectories: list of dicts with 'observations' and 'actions'
+        - self.trajectories: list of dicts
+        
+        Trajectory format options:
+        
+        1. New flat format (recommended):
+           Each trajectory is a dict with arbitrary keys, each mapping to (T, dim) arrays.
+           Set 'target_key' in dataset_config to specify which key is the prediction target.
+           
+           Example:
+           ```
+           self.trajectories.append({
+               'position': position_array,      # shape (T, 2) - input
+               'velocity': velocity_array,      # shape (T, 2) - input
+               'acceleration': accel_array,     # shape (T, 2) - target
+           })
+           # In dataset_config: {'target_key': 'acceleration'}
+           ```
+        
+        2. Legacy format (for backward compatibility):
+           Each trajectory has 'observations' (dict) and 'actions' keys.
+           
+           Example:
+           ```
+           self.trajectories.append({
+               'observations': {'position': ..., 'velocity': ...},
+               'actions': actions_array,
+           })
+           ```
         
         The parent class will automatically infer:
-        - self.state_token_dims: list of dimensions for each state token
-        - self.state_token_names: list of names for each state token (for dict format)
-        - self.act_dim: dimension of action space
+        - self.input_token_dims: list of dimensions for each input token
+        - self.input_token_names: list of names for each input token
+        - self.target_dim: dimension of target (prediction output)
         
-        Note: Subclasses can optionally set these properties manually if needed
-        (e.g., for backwards compatibility or special cases).
+        Note: Subclasses can optionally set these properties manually if needed.
         """
         raise NotImplementedError("Subclasses should implement this method.")
+    
+    def _detect_and_normalize_format(self):
+        """
+        Detect whether trajectories use flat format or legacy format.
+        For legacy format, convert internally to flat format for uniform processing.
+        """
+        if len(self.trajectories) == 0:
+            raise ValueError("No trajectories found in dataset.")
+        
+        first_traj = self.trajectories[0]
+        
+        # Check if using legacy format (has 'observations' and 'actions' keys)
+        if 'observations' in first_traj and 'actions' in first_traj:
+            self._is_legacy_format = True
+            self.target_key = 'actions'
+            
+            # Check if observations is a dict or array
+            if isinstance(first_traj['observations'], dict):
+                # Dict observations - set input keys from observation keys
+                self._input_keys = list(first_traj['observations'].keys())
+            else:
+                # Array observations - will handle in _infer_dataset_properties
+                self._input_keys = None
+        else:
+            # New flat format
+            self._is_legacy_format = False
+            
+            if self.target_key is None:
+                raise ValueError(
+                    "For flat trajectory format, 'target_key' must be specified in dataset_config. "
+                    "This indicates which key in the trajectory dict should be predicted."
+                )
+            
+            if self.target_key not in first_traj:
+                raise ValueError(
+                    f"target_key '{self.target_key}' not found in trajectory. "
+                    f"Available keys: {list(first_traj.keys())}"
+                )
+            
+            # All keys except target_key are inputs (unless explicitly set via input_keys)
+            if hasattr(self, 'input_keys') and self.input_keys is not None:
+                self._input_keys = self.input_keys
+            else:
+                self._input_keys = [k for k in first_traj.keys() if k != self.target_key]
+            
+            if len(self._input_keys) == 0:
+                raise ValueError(
+                    f"No input keys found. Trajectory only contains target_key '{self.target_key}'."
+                )
     
     def _infer_dataset_properties(self):
         """
@@ -117,97 +263,143 @@ class TrajectoryDataset(Dataset):
         if len(self.trajectories) == 0:
             raise ValueError("No trajectories found in dataset. Cannot infer properties.")
         
-        # Get first trajectory as reference
         first_traj = self.trajectories[0]
         
-        # Infer act_dim if not already set
-        if not hasattr(self, 'act_dim') or self.act_dim is None:
-            self.act_dim = first_traj['actions'].shape[-1]
-        
-        # Check if using dictionary format
-        is_dict_format = isinstance(first_traj['observations'], dict)
-        
-        if is_dict_format:
-            # Dictionary format: infer from keys and shapes
-            if not hasattr(self, 'state_token_names') or self.state_token_names is None:
-                self.state_token_names = list(first_traj['observations'].keys())
+        if self._is_legacy_format:
+            # Legacy format handling
+            # Infer target_dim if not already set
+            if not hasattr(self, 'target_dim') or self.target_dim is None:
+                self.target_dim = first_traj['actions'].shape[-1]
             
-            if not hasattr(self, 'state_token_dims') or self.state_token_dims is None:
-                self.state_token_dims = [
-                    first_traj['observations'][name].shape[-1] 
-                    for name in self.state_token_names
-                ]
+            # Check if observations is a dictionary
+            is_dict_obs = isinstance(first_traj['observations'], dict)
+            
+            if is_dict_obs:
+                # Dictionary observations
+                if not hasattr(self, 'input_token_names') or self.input_token_names is None:
+                    self.input_token_names = list(first_traj['observations'].keys())
+                
+                if not hasattr(self, 'input_token_dims') or self.input_token_dims is None:
+                    self.input_token_dims = [
+                        first_traj['observations'][name].shape[-1] 
+                        for name in self.input_token_names
+                    ]
+            else:
+                # Legacy tensor format
+                if not hasattr(self, 'input_token_dims') or self.input_token_dims is None:
+                    obs_shape = first_traj['observations'].shape
+                    if len(obs_shape) == 2:
+                        self.input_token_dims = [obs_shape[-1]]
+                    elif len(obs_shape) == 3:
+                        num_tokens = obs_shape[1]
+                        token_dim = obs_shape[2]
+                        self.input_token_dims = [token_dim] * num_tokens
+                    else:
+                        raise ValueError(f"Unexpected observation shape: {obs_shape}")
+                
+                if not hasattr(self, 'input_token_names') or self.input_token_names is None:
+                    self.input_token_names = None
         else:
-            # Legacy tensor format: infer from shape
-            if not hasattr(self, 'state_token_dims') or self.state_token_dims is None:
-                obs_shape = first_traj['observations'].shape
-                if len(obs_shape) == 2:
-                    # Shape is (T, state_dim) - single token
-                    self.state_token_dims = [obs_shape[-1]]
-                elif len(obs_shape) == 3:
-                    # Shape is (T, num_tokens, token_dim) - multiple tokens
-                    num_tokens = obs_shape[1]
-                    token_dim = obs_shape[2]
-                    self.state_token_dims = [token_dim] * num_tokens
-                else:
-                    raise ValueError(f"Unexpected observation shape: {obs_shape}")
+            # New flat format
+            # Infer target_dim
+            if not hasattr(self, 'target_dim') or self.target_dim is None:
+                self.target_dim = first_traj[self.target_key].shape[-1]
             
-            # Legacy format doesn't have token names
-            if not hasattr(self, 'state_token_names') or self.state_token_names is None:
-                self.state_token_names = None
+            # Infer input token names and dims
+            if not hasattr(self, 'input_token_names') or self.input_token_names is None:
+                self.input_token_names = self._input_keys
+            
+            if not hasattr(self, 'input_token_dims') or self.input_token_dims is None:
+                self.input_token_dims = [
+                    first_traj[name].shape[-1] 
+                    for name in self.input_token_names
+                ]
     
     def _compute_normalization_stats(self):
         """
         Compute normalization statistics for the dataset.
-        Handles both dictionary and legacy tensor formats.
+        Handles both flat format and legacy formats.
         """
         if len(self.trajectories) == 0:
             raise ValueError("No trajectories found in dataset")
         
-        # Check if using dictionary format
-        is_dict_format = isinstance(self.trajectories[0]['observations'], dict)
+        first_traj = self.trajectories[0]
         
-        if is_dict_format:
-            # Dictionary format: compute stats for each token separately
-            states_dict = {name: [] for name in self.state_token_names}
-            for traj in self.trajectories:
-                for name in self.state_token_names:
-                    states_dict[name].append(traj['observations'][name])
+        if self._is_legacy_format:
+            # Legacy format: check if observations is dict or array
+            is_dict_obs = isinstance(first_traj['observations'], dict)
             
-            self.state_mean = {}
-            self.state_std = {}
-            for name in self.state_token_names:
-                states_concat = np.concatenate(states_dict[name], axis=0)
-                self.state_mean[name] = np.mean(states_concat, axis=0)
-                self.state_std[name] = np.std(states_concat, axis=0) + 1e-6
+            if is_dict_obs:
+                # Dictionary observations: compute stats for each token
+                states_dict = {name: [] for name in self.input_token_names}
+                for traj in self.trajectories:
+                    for name in self.input_token_names:
+                        states_dict[name].append(traj['observations'][name])
+                
+                self.input_mean = {}
+                self.input_std = {}
+                for name in self.input_token_names:
+                    states_concat = np.concatenate(states_dict[name], axis=0)
+                    self.input_mean[name] = np.mean(states_concat, axis=0)
+                    self.input_std[name] = np.std(states_concat, axis=0) + 1e-6
+            else:
+                # Legacy tensor observations
+                states = []
+                for traj in self.trajectories:
+                    states.append(traj['observations'])
+                
+                states = np.concatenate(states, axis=0)
+                self.input_mean = np.mean(states, axis=0)
+                self.input_std = np.std(states, axis=0) + 1e-6
         else:
-            # Legacy tensor format
-            states = []
+            # New flat format: compute stats for each input token
+            input_data = {name: [] for name in self.input_token_names}
             for traj in self.trajectories:
-                states.append(traj['observations'])
+                for name in self.input_token_names:
+                    input_data[name].append(traj[name])
             
-            states = np.concatenate(states, axis=0)
-            self.state_mean = np.mean(states, axis=0)
-            self.state_std = np.std(states, axis=0) + 1e-6
+            self.input_mean = {}
+            self.input_std = {}
+            for name in self.input_token_names:
+                data_concat = np.concatenate(input_data[name], axis=0)
+                self.input_mean[name] = np.mean(data_concat, axis=0)
+                self.input_std[name] = np.std(data_concat, axis=0) + 1e-6
         
-        print(f"State mean: {self.state_mean}")
-        print(f"State std: {self.state_std}")
+        # Backward compatibility: alias state_mean/state_std to input_mean/input_std
+        self.state_mean = self.input_mean
+        self.state_std = self.input_std
+        
+        print(f"Input mean: {self.input_mean}")
+        print(f"Input std: {self.input_std}")
     
     def _normalize_trajectories(self):
         """
         Normalize all trajectories using computed statistics.
+        Only input tokens are normalized, not target.
         """
-        is_dict_format = isinstance(self.trajectories[0]['observations'], dict)
+        first_traj = self.trajectories[0]
         
-        if is_dict_format:
-            # Dictionary format: normalize each token separately
-            for traj in self.trajectories:
-                for name in self.state_token_names:
-                    traj['observations'][name] = (traj['observations'][name] - self.state_mean[name]) / self.state_std[name]
+        if self._is_legacy_format:
+            is_dict_obs = isinstance(first_traj['observations'], dict)
+            
+            if is_dict_obs:
+                # Dictionary observations: normalize each token
+                for traj in self.trajectories:
+                    for name in self.input_token_names:
+                        traj['observations'][name] = (
+                            traj['observations'][name] - self.input_mean[name]
+                        ) / self.input_std[name]
+            else:
+                # Legacy tensor observations
+                for traj in self.trajectories:
+                    traj['observations'] = (
+                        traj['observations'] - self.input_mean
+                    ) / self.input_std
         else:
-            # Legacy tensor format
+            # New flat format: normalize each input token
             for traj in self.trajectories:
-                traj['observations'] = (traj['observations'] - self.state_mean) / self.state_std
+                for name in self.input_token_names:
+                    traj[name] = (traj[name] - self.input_mean[name]) / self.input_std[name]
     
     def _split_train_val(self):
         """
@@ -270,48 +462,71 @@ class TrajectoryDataset(Dataset):
         if len(self.trajectories) == 0:
             raise ValueError("No trajectories in dataset")
         
-        # Check if using dictionary format
-        is_dict_format = isinstance(self.trajectories[0]['observations'], dict)
+        first_traj = self.trajectories[0]
         
-        if is_dict_format:
-            # Validate dictionary format
-            if not hasattr(self, 'state_token_names') or self.state_token_names is None:
-                raise ValueError("state_token_names must be set for dictionary format")
+        if self._is_legacy_format:
+            # Legacy format validation
+            is_dict_obs = isinstance(first_traj['observations'], dict)
             
-            if len(self.state_token_names) != len(self.state_token_dims):
-                raise ValueError(f"Length of state_token_names ({len(self.state_token_names)}) must match "
-                               f"state_token_dims ({len(self.state_token_dims)})")
+            if is_dict_obs:
+                # Validate dictionary observations
+                if not hasattr(self, 'input_token_names') or self.input_token_names is None:
+                    raise ValueError("input_token_names must be set for dictionary format")
+                
+                if len(self.input_token_names) != len(self.input_token_dims):
+                    raise ValueError(f"Length of input_token_names ({len(self.input_token_names)}) must match "
+                                   f"input_token_dims ({len(self.input_token_dims)})")
+                
+                # Check all trajectories have the same observation keys
+                expected_keys = set(self.input_token_names)
+                for i, traj in enumerate(self.trajectories):
+                    actual_keys = set(traj['observations'].keys())
+                    if actual_keys != expected_keys:
+                        raise ValueError(f"Trajectory {i} observations have keys {actual_keys}, expected {expected_keys}")
+        else:
+            # New flat format validation
+            if not hasattr(self, 'input_token_names') or self.input_token_names is None:
+                raise ValueError("input_token_names must be set")
             
-            # Check all trajectories have the same keys
-            expected_keys = set(self.state_token_names)
+            if len(self.input_token_names) != len(self.input_token_dims):
+                raise ValueError(f"Length of input_token_names ({len(self.input_token_names)}) must match "
+                               f"input_token_dims ({len(self.input_token_dims)})")
+            
+            # Check all trajectories have the expected keys (expected can be a subset of actual)
+            expected_keys = set(self.input_token_names + [self.target_key])
             for i, traj in enumerate(self.trajectories):
-                actual_keys = set(traj['observations'].keys())
-                if actual_keys != expected_keys:
-                    raise ValueError(f"Trajectory {i} has keys {actual_keys}, expected {expected_keys}")
+                actual_keys = set(traj.keys())
+                if not expected_keys.issubset(actual_keys):
+                    raise ValueError(f"Trajectory {i} has keys {actual_keys}, expected at least {expected_keys}")
         
         print(f"Dataset validation passed: {len(self.trajectories)} trajectories loaded")
-        print(f"  State token dims: {self.state_token_dims}")
-        if is_dict_format:
-            print(f"  State token names: {self.state_token_names}")
-        print(f"  Action dim: {self.act_dim}")
+        print(f"  Input token names: {self.input_token_names}")
+        print(f"  Input token dims: {self.input_token_dims}")
+        print(f"  Target key: {self.target_key}")
+        print(f"  Target dim: {self.target_dim}")
 
 
 
     def get_state_stats(self):
-        # if body:
-        #     return self.state_mean, self.state_std, self.body_mean, self.body_std
+        """
+        Get normalization statistics for input tokens.
+        Validates that no NaN values are present.
         
-        # Check if state_mean is a dictionary (new format) or array (legacy format)
-        if isinstance(self.state_mean, dict):
+        Returns:
+            tuple: (input_mean, input_std) - dict or array depending on format
+        """
+        # Check for NaN values
+        if isinstance(self.input_mean, dict):
             # Dictionary format: check each token
-            for key in self.state_mean.keys():
-                assert not np.any(np.isnan(self.state_mean[key])), f"State mean for '{key}' contains NaN values"
-                assert not np.any(np.isnan(self.state_std[key])), f"State std for '{key}' contains NaN values"
+            for key in self.input_mean.keys():
+                assert not np.any(np.isnan(self.input_mean[key])), f"Input mean for '{key}' contains NaN values"
+                assert not np.any(np.isnan(self.input_std[key])), f"Input std for '{key}' contains NaN values"
         else:
             # Legacy format
-            assert not np.any(np.isnan(self.state_mean)), "State mean contains NaN values"
-            assert not np.any(np.isnan(self.state_std)), "State std contains NaN values"
+            assert not np.any(np.isnan(self.input_mean)), "Input mean contains NaN values"
+            assert not np.any(np.isnan(self.input_std)), "Input std contains NaN values"
         
+        # Return using legacy names for backward compatibility
         return self.state_mean, self.state_std
 
     def get_val_dataset(self):
@@ -333,36 +548,96 @@ class TrajectoryDataset(Dataset):
     def __len__(self):
         return len(self.trajectories)
 
+    def get_traj_len(self, traj):
+        """
+        Get trajectory length from trajectory dict.
+        
+        Args:
+            traj: A trajectory dictionary from self.trajectories
+            
+        Returns:
+            int: Length of the trajectory (number of timesteps)
+        """
+        if self._is_legacy_format:
+            if isinstance(traj['observations'], dict):
+                first_key = list(traj['observations'].keys())[0]
+                return traj['observations'][first_key].shape[0]
+            else:
+                return traj['observations'].shape[0]
+        else:
+            # Flat format: use first input key
+            first_key = self.input_token_names[0]
+            return traj[first_key].shape[0]
+    
+    def get_inputs(self, traj):
+        """
+        Get input data from trajectory as dict.
+        
+        Args:
+            traj: A trajectory dictionary from self.trajectories
+            
+        Returns:
+            dict: Dictionary mapping input token names to their data arrays.
+                  For legacy tensor format, returns {'observations': tensor}.
+        """
+        if self._is_legacy_format:
+            if isinstance(traj['observations'], dict):
+                return traj['observations']
+            else:
+                # Legacy tensor format - wrap in dict with single key
+                return {'observations': traj['observations']}
+        else:
+            # Flat format: return dict of input keys
+            return {name: traj[name] for name in self.input_token_names}
+    
+    def get_target(self, traj):
+        """
+        Get target data from trajectory.
+        
+        Args:
+            traj: A trajectory dictionary from self.trajectories
+            
+        Returns:
+            np.ndarray: Target data array of shape (T, target_dim)
+        """
+        if self._is_legacy_format:
+            return traj['actions']
+        else:
+            return traj[self.target_key]
+    
+    # Keep private aliases for internal use
+    _get_traj_len = get_traj_len
+    _get_inputs = get_inputs
+    _get_target = get_target
+
     def __getitem__(self, idx):
         traj = self.trajectories[idx]
         dtype = torch.float32
         
-        # Check if observations is a dictionary (new format) or array (legacy format)
-        is_dict_format = isinstance(traj['observations'], dict)
+        traj_len = self.get_traj_len(traj)
+        inputs = self.get_inputs(traj)
+        target = self.get_target(traj)
         
-        if is_dict_format:
-            # New dictionary format
-            # Get trajectory length from the first state token
-            first_key = list(traj['observations'].keys())[0]
-            traj_len = traj['observations'][first_key].shape[0]
-        else:
-            # Legacy array format
-            traj_len = traj['observations'].shape[0]
+        # Check if inputs is a dictionary
+        is_dict_inputs = isinstance(inputs, dict) and len(inputs) > 0
+        # Special case: legacy tensor format wrapped in dict
+        is_single_tensor = is_dict_inputs and 'observations' in inputs and len(inputs) == 1 and not isinstance(list(inputs.values())[0], dict)
 
         if traj_len >= self.context_len:
             # sample random index to slice trajectory
             si = random.randint(0, traj_len - self.context_len)
 
-            if is_dict_format:
-                # Dictionary format: slice each state token separately
+            if is_dict_inputs and not is_single_tensor:
+                # Dictionary format: slice each input token separately
                 states = {}
-                for key, value in traj['observations'].items():
+                for key, value in inputs.items():
                     states[key] = torch.from_numpy(value[si : si + self.context_len]).to(dtype)
             else:
-                # Legacy array format
-                states = torch.from_numpy(traj['observations'][si : si + self.context_len]).to(dtype)
+                # Legacy array format (possibly wrapped in dict)
+                obs_data = inputs['observations'] if is_single_tensor else inputs
+                states = torch.from_numpy(obs_data[si : si + self.context_len]).to(dtype)
             
-            actions = torch.from_numpy(traj['actions'][si : si + self.context_len]).to(dtype)
+            actions = torch.from_numpy(target[si : si + self.context_len]).to(dtype)
             timesteps = torch.arange(start=si, end=si+self.context_len, step=1)
 
             # all ones since no padding
@@ -371,10 +646,10 @@ class TrajectoryDataset(Dataset):
         else:
             padding_len = self.context_len - traj_len
 
-            if is_dict_format:
-                # Dictionary format: pad each state token separately
+            if is_dict_inputs and not is_single_tensor:
+                # Dictionary format: pad each input token separately
                 states = {}
-                for key, value in traj['observations'].items():
+                for key, value in inputs.items():
                     state_tensor = torch.from_numpy(value).to(dtype)
                     padded_state = torch.cat([state_tensor,
                                             torch.zeros(([padding_len] + list(state_tensor.shape[1:])),
@@ -382,14 +657,15 @@ class TrajectoryDataset(Dataset):
                                            dim=0)
                     states[key] = padded_state
             else:
-                # Legacy array format
-                states = torch.from_numpy(traj['observations']).to(dtype)
+                # Legacy array format (possibly wrapped in dict)
+                obs_data = inputs['observations'] if is_single_tensor else inputs
+                states = torch.from_numpy(obs_data).to(dtype)
                 states = torch.cat([states,
                                     torch.zeros(([padding_len] + list(states.shape[1:])),
                                     dtype=dtype)],
                                    dim=0)
 
-            actions = torch.from_numpy(traj['actions']).to(dtype)
+            actions = torch.from_numpy(target).to(dtype)
             actions = torch.cat([actions,
                                 torch.zeros(([padding_len] + list(actions.shape[1:])),
                                 dtype=dtype)],
@@ -414,6 +690,10 @@ class TrajectoryDataset(Dataset):
     
 
 class ToyDataset(TrajectoryDataset):
+    """
+    Toy dataset demonstrating the legacy format with 'observations' dict and 'actions'.
+    This is kept for backward compatibility.
+    """
 
     def _setup_dataset(self, dataset_config):
         # Create trajectories - parent class will infer properties automatically
@@ -435,17 +715,63 @@ class ToyDataset(TrajectoryDataset):
             })
 
 
-class ToyDatasetPositionEstimator(TrajectoryDataset):
+class ToyDatasetFlat(TrajectoryDataset):
     """
-    Toy dataset for testing position estimator.
-    velocity token is a 2D velocity vector
-    noise token is a 2D random vector
-    actions are the positions, starting from (0,0) for each trajectory,
-    obtained by integrating the velocity vectors.
+    Toy dataset demonstrating the NEW flat format.
+    
+    In flat format, all data streams are at the same level in the trajectory dict.
+    Use 'target_key' in dataset_config to specify which key is the prediction target.
+    
+    Example usage:
+        data_cfg = {
+            'target_key': 'combined',  # This is what we want to predict
+            'num_trajectories': 100
+        }
+        dataset = ToyDatasetFlat(data_cfg, context_len=10)
     """
 
     def _setup_dataset(self, dataset_config):
-        # Create trajectories - parent class will infer properties automatically
+        self.trajectories = []
+        num_trajectories = dataset_config.get('num_trajectories', 100)
+        
+        for _ in range(num_trajectories):
+            traj_len = random.randint(10, 50)
+            
+            # All data streams are at the same level (flat structure)
+            position = 1 + 0.1*np.random.randn(traj_len, 2)
+            velocity = 2 + 0.1*np.random.randn(traj_len, 2)
+            
+            # Target: combined value to predict
+            combined = np.repeat((position[:,0] + velocity[:,0]).reshape(-1,1), repeats=2, axis=1)
+            
+            # Flat format: all keys at same level, target_key specifies prediction target
+            self.trajectories.append({
+                'position': position,     # input
+                'velocity': velocity,     # input
+                'combined': combined,     # target (specified via target_key in config)
+            })
+
+
+class ToyDatasetPositionEstimator(TrajectoryDataset):
+    """
+    Toy dataset for testing position estimator using the NEW flat format.
+    
+    Data streams:
+    - velocity: 2D velocity vector (input)
+    - noise: 2D random vector (input)  
+    - position: 2D position (target - to be predicted)
+    
+    Positions are obtained by integrating velocity vectors.
+    
+    Example usage:
+        data_cfg = {
+            'target_key': 'position',  # Predict position from velocity
+            'num_trajectories': 10000
+        }
+        dataset = ToyDatasetPositionEstimator(data_cfg, context_len=10)
+    """
+
+    def _setup_dataset(self, dataset_config):
         self.trajectories = []
         num_trajectories = dataset_config.get('num_trajectories', 10000)
         
@@ -458,7 +784,7 @@ class ToyDatasetPositionEstimator(TrajectoryDataset):
             # noise is a 2D random vector
             noise = np.random.randn(traj_len, 2)
             
-            # actions are positions obtained by integrating velocity
+            # positions obtained by integrating velocity
             # Starting from (0, 0) for each trajectory
             positions = np.zeros((traj_len, 2))
             positions[0] = np.array([0.0, 0.0])
@@ -466,25 +792,32 @@ class ToyDatasetPositionEstimator(TrajectoryDataset):
                 # Integrate velocity to get position (simple Euler integration)
                 positions[t] = positions[t-1] + velocity[t-1, :]
             
+            # Flat format: target_key='position' should be set in dataset_config
             self.trajectories.append({
-                'observations': {
-                    'velocity': velocity,
-                    'noise': noise
-                },
-                'actions': positions,
+                'velocity': velocity,   # input
+                'noise': noise,         # input
+                'position': positions,  # target
             })
 
 
 class ToyDatasetVelocityEstimator(TrajectoryDataset):
     """
-    Toy dataset for testing velocity estimator.
-    position token is a 2D position vector
-    noise token is a 2D random vector
-    actions are the velocities obtained by differentiating the positions.
+    Toy dataset for testing velocity estimator using the NEW flat format.
+    
+    Data streams:
+    - position: 2D position vector (input)
+    - noise: 2D random vector (input)
+    - velocity: 2D velocity (target - to be predicted)
+    
+    Example usage:
+        data_cfg = {
+            'target_key': 'velocity',  # Predict velocity from position
+            'num_trajectories': 10000
+        }
+        dataset = ToyDatasetVelocityEstimator(data_cfg, context_len=10)
     """
 
     def _setup_dataset(self, dataset_config):
-        # Create trajectories - parent class will infer properties automatically
         self.trajectories = []
         num_trajectories = dataset_config.get('num_trajectories', 10000)
         
@@ -505,12 +838,11 @@ class ToyDatasetVelocityEstimator(TrajectoryDataset):
                 # Integrate velocity to get position (simple Euler integration)
                 positions[t] = positions[t-1] + velocity[t-1, :]
             
+            # Flat format: target_key='velocity' should be set in dataset_config
             self.trajectories.append({
-                'observations': {
-                    'position': positions,
-                    'noise': noise
-                },
-                'actions': velocity,
+                'position': positions,  # input
+                'noise': noise,         # input
+                'velocity': velocity,   # target
             })
 
 
@@ -1043,11 +1375,21 @@ class QuickDistill(TrajectoryDataset):
 if __name__ == "__main__":
     from capyformer.decision_transformer import Trainer
 
-    # Call train with explicit parameters
-    dataset_path_list = glob.glob("./debug/test_dataset/*.npz")
-    context_len=10
-    data_cfg = {"dataset_path": dataset_path_list}
+    # Example using NEW flat format with ToyDatasetVelocityEstimator
+    # The 'target_key' specifies which data stream to predict
+    context_len = 10
+    data_cfg = {
+        "target_key": "velocity",  # This is what we want to predict
+        "num_trajectories": 1000,
+    }
     traj_dataset = ToyDatasetVelocityEstimator(data_cfg, context_len)
+    
+    print("\n=== Dataset Info ===")
+    print(f"Input token names: {traj_dataset.input_token_names}")
+    print(f"Input token dims: {traj_dataset.input_token_dims}")
+    print(f"Target key: {traj_dataset.target_key}")
+    print(f"Target dim: {traj_dataset.target_dim}")
+    print(f"Number of trajectories: {len(traj_dataset)}")
     
     dt = Trainer(
         traj_dataset,
@@ -1065,11 +1407,14 @@ if __name__ == "__main__":
     )
 
 
-    # dataset_path_list = glob.glob("./debug/test_dataset/*.npz")
-    # context_len=10
-    # data_cfg = {"dataset_path": dataset_path_list}
+    # # Example using ToyDatasetPositionEstimator with flat format
+    # context_len = 10
+    # data_cfg = {
+    #     "target_key": "position",  # Predict position from velocity
+    #     "num_trajectories": 1000,
+    # }
     # traj_dataset = ToyDatasetPositionEstimator(data_cfg, context_len)
-    
+    # 
     # dt = Trainer(
     #     traj_dataset,
     #     log_dir="./debug",
@@ -1079,6 +1424,11 @@ if __name__ == "__main__":
     #     h_dim=256,
     #     n_heads=1,
     #     batch_size=32,
+    #     action_is_velocity=False
+    # )
+    # dt.learn(
+    #     n_epochs=10000,
+    # )
     #     action_is_velocity=False
     # )
     # dt.learn(

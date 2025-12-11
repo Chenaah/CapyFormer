@@ -78,9 +78,221 @@ class Trainer():
         self.validation_trajectories = validation_trajectories
         self.action_is_velocity = action_is_velocity
         self.dt = dt
+        
+        # Will be set after training
+        self.model = None
 
         if not os.path.exists(self.log_dir):
             os.makedirs(self.log_dir)
+    
+    def get_inference(self, device: str = None):
+        """
+        Get an inference wrapper for easy step-by-step prediction.
+        
+        Must be called after learn() or after loading a trained model.
+        
+        Args:
+            device: Device to run inference on. If None, uses trainer's device.
+        
+        Returns:
+            TransformerInference instance
+        
+        Example:
+            trainer = Trainer(dataset, log_dir="./logs")
+            trainer.learn(n_epochs=100)
+            
+            inference = trainer.get_inference()
+            
+            for t in range(episode_length):
+                state = {'position': pos, 'velocity': vel}
+                prediction = inference.step(state)
+        """
+        if self.model is None:
+            raise RuntimeError(
+                "No model available. Call learn() first or load a checkpoint."
+            )
+        
+        if device is None:
+            device = self.device
+        
+        return self.model.get_inference(device=device)
+    
+    def save(self, path: str, save_torchscript: bool = True):
+        """
+        Save the trained model checkpoint.
+        
+        Args:
+            path: Path to save the checkpoint (without extension).
+                  Will create {path}.pt for checkpoint and {path}.jit for TorchScript.
+            save_torchscript: Whether to also save a TorchScript version for deployment.
+        
+        Example:
+            trainer.learn(n_epochs=100)
+            trainer.save("./models/my_model")
+            # Creates: ./models/my_model.pt and ./models/my_model.jit
+        """
+        if self.model is None:
+            raise RuntimeError(
+                "No model available. Call learn() first."
+            )
+        
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+        
+        # Remove extension if provided
+        if path.endswith(".pt") or path.endswith(".jit"):
+            path = path.rsplit(".", 1)[0]
+        
+        checkpoint_path = f"{path}.pt"
+        
+        # Save full checkpoint (model + metadata)
+        # Handle state_mean/state_std which can be dict or tensor
+        state_mean = getattr(self.model, 'state_mean', None)
+        state_std = getattr(self.model, 'state_std', None)
+        
+        if isinstance(state_mean, dict):
+            state_mean = {k: v.cpu() if hasattr(v, 'cpu') else v for k, v in state_mean.items()}
+        elif hasattr(state_mean, 'cpu'):
+            state_mean = state_mean.cpu()
+            
+        if isinstance(state_std, dict):
+            state_std = {k: v.cpu() if hasattr(v, 'cpu') else v for k, v in state_std.items()}
+        elif hasattr(state_std, 'cpu'):
+            state_std = state_std.cpu()
+        
+        checkpoint = {
+            "model_state_dict": self.model.state_dict(),
+            "model_config": {
+                "state_token_dims": self.state_token_dims,
+                "state_token_names": getattr(self.model, 'state_token_names', None),
+                "act_dim": self.act_dim,
+                "n_blocks": self.n_blocks,
+                "h_dim": self.h_dim,
+                "context_len": self.context_len,
+                "n_heads": self.n_heads,
+                "drop_p": self.drop_p,
+                "shared_state_embedding": self.shared_state_embedding,
+                "use_action_tanh": self.use_action_tanh,
+                "state_mean": state_mean,
+                "state_std": state_std,
+            },
+            "trainer_config": {
+                "device": self.device,
+                "action_is_velocity": self.action_is_velocity,
+                "dt": self.dt,
+            }
+        }
+        
+        torch.save(checkpoint, checkpoint_path)
+        print(f"Checkpoint saved to {checkpoint_path}")
+        
+        # Save TorchScript version for deployment
+        if save_torchscript:
+            jit_path = f"{path}.jit"
+            try:
+                model_cpu = copy.deepcopy(self.model).to('cpu')
+                traced_script_module = torch.jit.script(model_cpu)
+                traced_script_module.save(jit_path)
+                print(f"TorchScript model saved to {jit_path}")
+            except Exception as e:
+                print(f"Warning: Could not save TorchScript model: {e}")
+    
+    def load(self, path: str, device: str = None):
+        """
+        Load a model from checkpoint.
+        
+        Args:
+            path: Path to the checkpoint file (.pt).
+            device: Device to load the model to. If None, uses trainer's device.
+        
+        Returns:
+            self (for chaining)
+        
+        Example:
+            trainer = Trainer(dataset, log_dir="./logs")
+            trainer.load("./models/my_model.pt")
+            inference = trainer.get_inference()
+        """
+        if device is None:
+            device = self.device
+        
+        if not path.endswith(".pt"):
+            path = f"{path}.pt"
+        
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"No checkpoint found at {path}")
+        
+        print(f"Loading checkpoint from {path}")
+        checkpoint = torch.load(path, map_location=device)
+        
+        config = checkpoint["model_config"]
+        
+        # Get state stats from checkpoint or dataset
+        state_mean = config.get("state_mean")
+        state_std = config.get("state_std")
+        if state_mean is None or state_std is None:
+            state_mean, state_std = self.traj_dataset.get_state_stats()
+        
+        # Reconstruct the model
+        self.model = Transformer(
+            state_token_dims=config["state_token_dims"],
+            state_token_names=config.get("state_token_names"),
+            act_dim=config["act_dim"],
+            n_blocks=config["n_blocks"],
+            h_dim=config["h_dim"],
+            context_len=config["context_len"],
+            n_heads=config["n_heads"],
+            drop_p=config["drop_p"],
+            state_mean=state_mean,
+            state_std=state_std,
+            shared_state_embedding=config.get("shared_state_embedding", True),
+            use_action_tanh=config.get("use_action_tanh", False),
+        ).to(device)
+        
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.model.eval()
+        
+        # Update trainer config if available
+        trainer_config = checkpoint.get("trainer_config", {})
+        if "action_is_velocity" in trainer_config:
+            self.action_is_velocity = trainer_config["action_is_velocity"]
+        if "dt" in trainer_config:
+            self.dt = trainer_config["dt"]
+        
+        print(f"Model loaded successfully from {path}")
+        return self
+    
+    @staticmethod
+    def load_torchscript(path: str, device: str = "cuda:0"):
+        """
+        Load a TorchScript model directly (without Trainer).
+        
+        This is useful for deployment when you don't need the full Trainer.
+        
+        Args:
+            path: Path to the TorchScript file (.jit).
+            device: Device to load the model to.
+        
+        Returns:
+            TorchScript model ready for inference
+        
+        Example:
+            model = Trainer.load_torchscript("./models/my_model.jit")
+            # Use directly for inference
+            with torch.no_grad():
+                _, action_pred, _ = model(timesteps, states, actions)
+        """
+        if not path.endswith(".jit"):
+            path = f"{path}.jit"
+        
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"No TorchScript model found at {path}")
+        
+        print(f"Loading TorchScript model from {path}")
+        model = torch.jit.load(path, map_location=device)
+        model.eval()
+        print(f"TorchScript model loaded successfully")
+        return model
 
     def validate_rollout(self, model, device):
         """
@@ -105,34 +317,34 @@ class Trainer():
                 traj_idx = random.randint(0, len(self.traj_dataset.val_trajectories) - 1)
                 traj = self.traj_dataset.val_trajectories[traj_idx]
 
-                # Check if observations is a dictionary (new format) or array (legacy format)
-                is_dict_format = isinstance(traj['observations'], dict)
+                # Use dataset methods to access trajectory data (works for both flat and legacy formats)
+                inputs = self.traj_dataset.get_inputs(traj)
+                target_gt = self.traj_dataset.get_target(traj)
+                traj_len = self.traj_dataset.get_traj_len(traj)
                 
-                # Get trajectory length
-                if is_dict_format:
-                    first_key = list(traj['observations'].keys())[0]
-                    traj_len = traj['observations'][first_key].shape[0]
-                else:
-                    traj_len = traj['observations'].shape[0]
+                # Check if inputs is a dictionary - model always expects dict format now
+                is_dict_format = isinstance(inputs, dict)
 
                 traj_len = min(traj_len, 200)  # Limit length for validation speed
                     
                 if traj_len < 2:
                     continue
                 
-                actions_gt = traj['actions']
-                
                 actions = torch.zeros((1, traj_len, self.act_dim),
                         dtype=torch.float32, device=device)
                 
-                # Initialize states based on format
+                # Initialize states - always as dictionary for model compatibility
                 if is_dict_format:
-                    states = {key: torch.zeros((1, traj_len, traj['observations'][key].shape[1]),
+                    states = {key: torch.zeros((1, traj_len, inputs[key].shape[-1]),
                                                dtype=torch.float32, device=device)
-                             for key in traj['observations'].keys()}
+                             for key in inputs.keys()}
                 else:
-                    states = torch.zeros(1, traj_len, *self.state_token_dims,
-                                        dtype=torch.float32, device=device)
+                    # This shouldn't happen with the new API, but handle legacy tensor format
+                    # by wrapping in a dict with default token names
+                    raise ValueError(
+                        "Legacy tensor format not supported. "
+                        "Use dictionary format for observations/inputs."
+                    )
                 
                 timesteps = torch.arange(start=0, end=traj_len, step=1)
                 timesteps = timesteps.repeat(1, 1).to(device)
@@ -141,22 +353,14 @@ class Trainer():
                 predicted_actions = []
                 for t in range(traj_len - 1):
                     
-                    if is_dict_format:
-                        # Dictionary format: update each state token
-                        for key in traj['observations'].keys():
-                            running_state = traj['observations'][key][t]
-                            states[key][:,t,:] = torch.tensor(running_state, device=device)
-                    else:
-                        # Legacy format: update single state tensor
-                        running_state = traj['observations'][t]
-                        states[:,t,:] = torch.tensor(running_state, device=device)
+                    # Dictionary format: update each state token
+                    for key in inputs.keys():
+                        running_state = inputs[key][t]
+                        states[key][:,t,:] = torch.tensor(running_state, device=device)
 
                     if t < self.context_len:
                         # Use context from start to current position
-                        if is_dict_format:
-                            states_slice = {key: states[key][:,:self.context_len] for key in states.keys()}
-                        else:
-                            states_slice = states[:,:self.context_len]
+                        states_slice = {key: states[key][:,:self.context_len] for key in states.keys()}
                             
                         _, act_preds, _ = model.forward(timesteps[:,:self.context_len],
                                                 states_slice,
@@ -165,10 +369,7 @@ class Trainer():
                         # Get prediction at position t
                         pred_action = act_preds[:, t].detach()
                     else:
-                        if is_dict_format:
-                            states_slice = {key: states[key][:,t-self.context_len+1:t+1] for key in states.keys()}
-                        else:
-                            states_slice = states[:,t-self.context_len+1:t+1]
+                        states_slice = {key: states[key][:,t-self.context_len+1:t+1] for key in states.keys()}
                             
                         _, act_preds, _ = model.forward(timesteps[:,t-self.context_len+1:t+1],
                                             states_slice,
@@ -182,12 +383,12 @@ class Trainer():
                     predicted_actions.append(pred_action.squeeze(0).cpu())
                     
                 
-                # Compute MSE between predicted and actual actions
+                # Compute MSE between predicted and actual targets
                 if len(predicted_actions) > 0:
                     predicted_actions = torch.stack(predicted_actions)
-                    actual_actions = torch.from_numpy(actions_gt[:len(predicted_actions)]).float()
+                    actual_targets = torch.from_numpy(target_gt[:len(predicted_actions)]).float()
                     
-                    mse = F.mse_loss(predicted_actions, actual_actions, reduction='sum')
+                    mse = F.mse_loss(predicted_actions, actual_targets, reduction='sum')
                     total_mse += mse.item()
                     num_predictions += len(predicted_actions)
                     # print(f"Trajectory MSE: {mse.item():.6f}")
@@ -196,7 +397,7 @@ class Trainer():
                     plot_position = True
                     if plot_position:
                         pred_actions_np = predicted_actions.numpy()[:, :2]
-                        actual_actions_np = actual_actions.numpy()[:, :2]
+                        actual_actions_np = actual_targets.numpy()[:, :2]
                         
                         if self.action_is_velocity:
                             # Actions are velocities - integrate to get positions starting from (0, 0)
@@ -267,7 +468,15 @@ class Trainer():
     def learn(
         self,
         n_epochs: int = None,
+        save_final: bool = True,
     ):
+        """
+        Train the model.
+        
+        Args:
+            n_epochs: Number of training epochs. If None, automatically determined.
+            save_final: Whether to save checkpoint at the end of training.
+        """
 
         state_dim = np.sum(self.state_token_dims)
         # training and evaluation device
@@ -428,13 +637,21 @@ class Trainer():
             # traced_script_module = torch.jit.script(copy.deepcopy(model).to('cpu'))
             # traced_script_module.save(os.path.join(self.log_dir, str(epoch%10)+".jit"))
 
+        # Store the trained model for later use (e.g., get_inference())
+        self.model = model
 
         tqdm.write("=" * 60)
         tqdm.write("finished training!")
         tqdm.write("=" * 60)
         
+        # Auto-save final checkpoint
+        if save_final:
+            final_path = os.path.join(self.log_dir, "final")
+            self.save(final_path, save_torchscript=True)
 
         wandb.finish()
+        
+        return self
 
 def _save_conf(conf, conf_name, log_dir, notes=None):
     if not os.path.exists(log_dir):
