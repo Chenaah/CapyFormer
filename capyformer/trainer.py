@@ -17,8 +17,6 @@ import torch
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.vec_env import DummyVecEnv, VecEnv
 import yaml
 
 from capyformer.model import Transformer

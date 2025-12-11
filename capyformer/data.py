@@ -1373,7 +1373,7 @@ class QuickDistill(TrajectoryDataset):
 
 
 if __name__ == "__main__":
-    from capyformer.decision_transformer import Trainer
+    from capyformer.trainer import Trainer
 
     # Example using NEW flat format with ToyDatasetVelocityEstimator
     # The 'target_key' specifies which data stream to predict

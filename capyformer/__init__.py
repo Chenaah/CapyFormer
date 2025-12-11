@@ -6,6 +6,7 @@ __version__ = "0.1.0"
 
 from capyformer.model import Transformer, TransformerInference, MaskedCausalAttention, Block
 from capyformer.data import TrajectoryDataset, ModuleTrajectoryDataset
+from capyformer.trainer import Trainer
 from capyformer.rnn_model import RNNModel
 from capyformer.rnn_trainer import RNNTrainer
 
@@ -16,6 +17,7 @@ __all__ = [
     "Block",
     "TrajectoryDataset",
     "ModuleTrajectoryDataset",
+    "Trainer",
     "RNNModel",
     "RNNTrainer",
 ]
