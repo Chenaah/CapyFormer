@@ -10,7 +10,7 @@ The dataset generates fake position trajectories and calculates velocities from 
 import numpy as np
 import random
 from capyformer.data import TrajectoryDataset
-from capyformer.decision_transformer import Trainer
+from capyformer.trainer import Trainer
 
 
 class ToyPositionVelocityDataset(TrajectoryDataset):

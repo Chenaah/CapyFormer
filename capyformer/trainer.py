@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader
 import yaml
 
 from capyformer.model import Transformer
-from capyformer.data import ModuleTrajectoryDataset, ToyDataset, ToyDatasetPositionEstimator, TrajectoryDataset
+from capyformer.data import ModuleTrajectoryDataset, ToyDataset, ToyDatasetPositionEstimator, TrajectoryDataset #, trajectory_collate_fn
 import wandb
 
 from tqdm import trange, tqdm
@@ -294,13 +294,22 @@ class Trainer():
 
     def validate_rollout(self, model, device):
         """
-        Validate the model by performing trajectory rollouts.
+        Validate the model by performing trajectory rollouts using the inference API.
+        
+        Uses model.get_inference() to ensure validation matches actual usage pattern.
+        The inference wrapper handles:
+        - Context window management
+        - Missing token masking (NaN values replaced with zeros and masked in attention)
+        - State normalization (val_trajectories are stored unnormalized for this purpose)
+        
         For each sampled trajectory:
-        1. Start from the initial state
-        2. Predict the first action using only the first state
-        3. Use the predicted action and the actual next state to predict the next action
-        4. Continue rolling out predictions using actual states but predicted actions
-        5. Compute the error between predicted and actual actions
+        1. Start from the initial state (raw/unnormalized)
+        2. Feed states step-by-step through inference.step() which normalizes them
+        3. Collect predictions and compute MSE against ground truth targets
+        
+        Note: val_trajectories are intentionally kept in raw (unnormalized) form so that
+        validation properly tests the full inference pipeline including normalization,
+        matching the actual deployment scenario.
         
         Returns:
             Average MSE across all validation trajectories
@@ -308,6 +317,9 @@ class Trainer():
         model.eval()
         total_mse = 0.0
         num_predictions = 0
+        
+        # Create inference wrapper - handles context management and NaN masking
+        inference = model.get_inference(device=device, context_len=self.context_len)
         
         with torch.no_grad():
             for _ in range(self.validation_trajectories):
@@ -321,81 +333,73 @@ class Trainer():
                 traj_len = self.traj_dataset.get_traj_len(traj)
                 
                 # Check if inputs is a dictionary - model always expects dict format now
-                is_dict_format = isinstance(inputs, dict)
+                if not isinstance(inputs, dict):
+                    raise ValueError(
+                        "Legacy tensor format not supported. "
+                        "Use dictionary format for observations/inputs."
+                    )
 
                 traj_len = min(traj_len, 200)  # Limit length for validation speed
                     
                 if traj_len < 2:
                     continue
                 
-                actions = torch.zeros((1, traj_len, self.act_dim),
-                        dtype=torch.float32, device=device)
+                # Reset inference state for new trajectory
+                inference.reset()
                 
-                # Initialize states - always as dictionary for model compatibility
-                if is_dict_format:
-                    states = {key: torch.zeros((1, traj_len, inputs[key].shape[-1]),
-                                               dtype=torch.float32, device=device)
-                             for key in inputs.keys()}
-                else:
-                    # This shouldn't happen with the new API, but handle legacy tensor format
-                    # by wrapping in a dict with default token names
-                    raise ValueError(
-                        "Legacy tensor format not supported. "
-                        "Use dictionary format for observations/inputs."
-                    )
-                
-                timesteps = torch.arange(start=0, end=traj_len, step=1)
-                timesteps = timesteps.repeat(1, 1).to(device)
-                
-                # Predict actions step by step
+                # Predict actions step by step using inference wrapper
                 predicted_actions = []
                 for t in range(traj_len - 1):
-                    
-                    # Dictionary format: update each state token
+                    # Build current state dict for this timestep
+                    # Missing tokens (NaN values) are handled by the inference wrapper:
+                    # - If a key has all NaN values, pass None to mark it as missing
+                    # - If a key has partial NaN, pass the value and let inference handle it
+                    current_state = {}
                     for key in inputs.keys():
-                        running_state = inputs[key][t]
-                        states[key][:,t,:] = torch.tensor(running_state, device=device)
-
-                    if t < self.context_len:
-                        # Use context from start to current position
-                        states_slice = {key: states[key][:,:self.context_len] for key in states.keys()}
-                            
-                        _, act_preds, _ = model.forward(timesteps[:,:self.context_len],
-                                                states_slice,
-                                                actions[:,:self.context_len])
-
-                        # Get prediction at position t
-                        pred_action = act_preds[:, t].detach()
-                    else:
-                        states_slice = {key: states[key][:,t-self.context_len+1:t+1] for key in states.keys()}
-                            
-                        _, act_preds, _ = model.forward(timesteps[:,t-self.context_len+1:t+1],
-                                            states_slice,
-                                            actions[:,t-self.context_len+1:t+1])
-                        # Get prediction at the last position
-                        pred_action = act_preds[:, -1].detach()
+                        state_value = inputs[key][t]
+                        if np.all(np.isnan(state_value)):
+                            # Entire token is missing - pass None
+                            current_state[key] = None
+                        else:
+                            # Token present (may have partial NaN from dimension padding)
+                            # Replace any NaN with 0 for now (dimension padding case)
+                            current_state[key] = np.nan_to_num(state_value, nan=0.0)
                     
-                    actions[:, t] = pred_action
-                    
-                    # Store the predicted action
-                    predicted_actions.append(pred_action.squeeze(0).cpu())
-                    
+                    # inference.step() handles:
+                    # - Normalizing states using stored mean/std
+                    # - Managing context window
+                    # - Masking missing tokens in attention
+                    pred_action = inference.step(current_state, return_numpy=False)
+                    predicted_actions.append(pred_action.cpu())
                 
                 # Compute MSE between predicted and actual targets
                 if len(predicted_actions) > 0:
                     predicted_actions = torch.stack(predicted_actions)
                     actual_targets = torch.from_numpy(target_gt[:len(predicted_actions)]).float()
                     
-                    mse = F.mse_loss(predicted_actions, actual_targets, reduction='sum')
-                    total_mse += mse.item()
-                    num_predictions += len(predicted_actions)
-                    # print(f"Trajectory MSE: {mse.item():.6f}")
+                    # Mask out NaN values in targets (from padded target dimensions)
+                    # Predictions should not have NaN since inference handles missing inputs
+                    valid_mask = ~torch.isnan(actual_targets)
                     
-                    # Plot 2D trajectories if action dimension is 2
+                    if valid_mask.any():
+                        pred_masked = predicted_actions[valid_mask]
+                        target_masked = actual_targets[valid_mask]
+                        mse = F.mse_loss(pred_masked, target_masked, reduction='sum')
+                        num_valid = valid_mask.sum().item()
+                        
+                        total_mse += mse.item()
+                        num_predictions += num_valid
+                        traj_mse = mse.item() / num_valid if num_valid > 0 else 0.0
+                    else:
+                        # Skip this trajectory if no valid targets
+                        traj_mse = 0.0
+                    
+                    # Plot 2D trajectories if action dimension >= 2
                     plot_position = True
-                    if plot_position:
-                        pred_actions_np = predicted_actions.numpy()[:, :2]
-                        actual_actions_np = actual_targets.numpy()[:, :2]
+                    if plot_position and valid_mask.any() and self.act_dim >= 2:
+                        # Replace NaN with 0 for plotting (only affects padded dimensions)
+                        pred_actions_np = np.nan_to_num(predicted_actions.numpy()[:, :2], nan=0.0)
+                        actual_actions_np = np.nan_to_num(actual_targets.numpy()[:, :2], nan=0.0)
                         
                         if self.action_is_velocity:
                             # Actions are velocities - integrate to get positions starting from (0, 0)
@@ -424,7 +428,7 @@ class Trainer():
                             
                             plt.xlabel('X Position', fontsize=12)
                             plt.ylabel('Y Position', fontsize=12)
-                            plt.title(f'2D Trajectory Comparison (Traj {traj_idx}, MSE: {mse.item():.6f})', fontsize=14)
+                            plt.title(f'2D Trajectory Comparison (Traj {traj_idx}, MSE: {traj_mse:.6f})', fontsize=14)
                             plt.legend(fontsize=10)
                             plt.grid(True, alpha=0.3)
                             plt.axis('equal')  # Equal aspect ratio for better visualization
@@ -444,7 +448,7 @@ class Trainer():
                             
                             plt.xlabel('Action Dimension 0', fontsize=12)
                             plt.ylabel('Action Dimension 1', fontsize=12)
-                            plt.title(f'2D Trajectory Comparison (Traj {traj_idx}, MSE: {mse.item():.6f})', fontsize=14)
+                            plt.title(f'2D Trajectory Comparison (Traj {traj_idx}, MSE: {traj_mse:.6f})', fontsize=14)
                             plt.legend(fontsize=10)
                             plt.grid(True, alpha=0.3)
                         
@@ -502,7 +506,8 @@ class Trainer():
                                 batch_size=self.batch_size,
                                 shuffle=True,
                                 pin_memory=True,
-                                drop_last=True
+                                drop_last=True,
+                                # collate_fn=trajectory_collate_fn  # Custom collate for state_mask support
                             )
 
         n_epochs = int(1e6 / len(traj_data_loader)) if n_epochs is None else n_epochs
@@ -564,7 +569,9 @@ class Trainer():
             log_action_losses = []
             model.train()
 
-            for timesteps, states, actions, traj_mask in iter(traj_data_loader):
+            for batch_data in iter(traj_data_loader):
+                # Unpack batch data - now includes optional state_mask
+                timesteps, states, actions, traj_mask, state_mask = batch_data
 
                 timesteps = timesteps.to(device)    # B x T
                 
@@ -575,6 +582,15 @@ class Trainer():
                 else:
                     # Legacy tensor format
                     states = states.to(device)          # B x T x state_dim
+                
+                # Handle state_mask (for missing tokens)
+                # state_mask can be a dict of tensors, or a list/tuple of Nones from collation
+                if state_mask is not None:
+                    if isinstance(state_mask, dict):
+                        # Move each mask tensor to device
+                        state_mask = {key: value.to(device) for key, value in state_mask.items()}
+                    else:
+                        pdb.set_trace()
                     
                 actions = actions.to(device)        # B x T x act_dim
                 # returns_to_go = returns_to_go.to(device).unsqueeze(dim=-1) # B x T x 1
@@ -584,13 +600,23 @@ class Trainer():
                 state_preds, action_preds, return_preds = model.forward(
                                                                 timesteps=timesteps,
                                                                 states=states,
-                                                                actions=actions
+                                                                actions=actions,
+                                                                state_mask=state_mask
                                                             )
                 # only consider non padded elements
                 action_preds = action_preds.view(-1, self.act_dim)[traj_mask.view(-1,) > 0]
                 action_target = action_target.view(-1, self.act_dim)[traj_mask.view(-1,) > 0]
 
-                action_loss = F.mse_loss(action_preds, action_target, reduction='mean')
+                # Mask out NaN values in target (from padded target dimensions)
+                valid_target_mask = ~torch.isnan(action_target)
+                if valid_target_mask.all():
+                    # No NaN values - use standard MSE loss
+                    action_loss = F.mse_loss(action_preds, action_target, reduction='mean')
+                else:
+                    # Mask out NaN values from both predictions and targets
+                    action_preds_masked = action_preds[valid_target_mask]
+                    action_target_masked = action_target[valid_target_mask]
+                    action_loss = F.mse_loss(action_preds_masked, action_target_masked, reduction='mean')
 
                 optimizer.zero_grad()
                 action_loss.backward()
@@ -792,7 +818,16 @@ class ModularDecisionTransformer(Trainer):
                 action_preds = action_preds * module_mask
                 action_target = action_target * module_mask
 
-                action_loss = F.mse_loss(action_preds, action_target, reduction='mean')
+                # Mask out NaN values in target (from padded target dimensions)
+                valid_target_mask = ~torch.isnan(action_target)
+                if valid_target_mask.all():
+                    # No NaN values - use standard MSE loss
+                    action_loss = F.mse_loss(action_preds, action_target, reduction='mean')
+                else:
+                    # Mask out NaN values from both predictions and targets
+                    action_preds_masked = action_preds[valid_target_mask]
+                    action_target_masked = action_target[valid_target_mask]
+                    action_loss = F.mse_loss(action_preds_masked, action_target_masked, reduction='mean')
 
                 optimizer.zero_grad()
                 action_loss.backward()

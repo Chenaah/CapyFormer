@@ -1,5 +1,5 @@
 import copy
-from typing import Tuple
+from typing import Tuple, List, Optional, Dict, Any
 from collections import defaultdict
 import glob
 import multiprocessing
@@ -95,6 +95,17 @@ class TrajectoryDataset(Dataset):
        }
        ```
     
+    Configuration options (in dataset_config):
+        target_key: Key for prediction target (required for flat format)
+        input_keys: List of input keys to use (optional, auto-detected if not provided)
+        val_split: Fraction or count of trajectories for validation (optional)
+        pad_value: Value to use for padding missing keys/dimensions (default: np.nan)
+                   - np.nan: Enables automatic masking, values excluded from normalization
+                   - 0.0: Values treated as real data, included in normalization
+    
+    Subclass attributes (can be set in _setup_dataset):
+        pad_value: Override padding value (np.nan or 0.0)
+    
     Properties:
         input_token_names: list of input token names (keys)
         input_token_dims: list of dimensions for each input token
@@ -117,8 +128,29 @@ class TrajectoryDataset(Dataset):
         # Get target key from config (defaults to 'actions' for legacy format)
         self.target_key = dataset_config.get('target_key', None)
         
-        # Subclass should populate trajectories
+        # Store input_keys from config if provided (used to filter auto-fill)
+        # If not provided, will be auto-detected later in _detect_and_normalize_format
+        self.input_keys = dataset_config.get('input_keys', None)
+        
+        # Default pad value (can be overridden by subclass in _setup_dataset)
+        # np.nan enables automatic masking; 0.0 treats padding as real values
+        self.pad_value = np.nan
+        
+        # Subclass should populate trajectories (and optionally set self.pad_value)
         self._setup_dataset(dataset_config)
+        
+        # Allow pad_value to be set via dataset_config as well
+        if 'pad_value' in dataset_config:
+            self.pad_value = dataset_config['pad_value']
+        
+        # Fill missing keys across trajectories with pad_value (for automatic masking if NaN)
+        # Only fills keys that are in self.input_keys (if specified)
+
+        
+        self._fill_missing_keys()
+        
+        # Pad targets to maximum dimension across trajectories (with NaN)
+        self._pad_target_to_max_dim()
         
         # Detect and convert format if needed
         self._detect_and_normalize_format()
@@ -126,16 +158,22 @@ class TrajectoryDataset(Dataset):
         # Parent class infers dataset properties from trajectories
         self._infer_dataset_properties()
         
-        # Parent class handles normalization and validation
-        self._compute_normalization_stats()
-        self._normalize_trajectories()
-        
-        # Optional: split into train/validation sets
+        # Split into train/validation sets BEFORE normalization
+        # This keeps validation trajectories in raw (unnormalized) form
+        # so that validation through inference.step() properly tests the full pipeline
+        # including the normalization step that happens during actual deployment
         self.val_split = dataset_config.get('val_split', None)
         if self.val_split is not None:
-            self._split_train_val()
+            self._split_train_val_raw()
         else:
-            self.val_trajectories = self.trajectories
+            # Use deep copy so validation stays unnormalized when we normalize trajectories
+            self.val_trajectories = copy.deepcopy(self.trajectories)
+        
+        # Parent class handles normalization and validation
+        # Note: Only self.trajectories (training data) gets normalized
+        # self.val_trajectories stays raw for proper validation through inference wrapper
+        self._compute_normalization_stats()
+        self._normalize_trajectories()
         
         self._validate_dataset()
     
@@ -202,9 +240,249 @@ class TrajectoryDataset(Dataset):
         - self.input_token_names: list of names for each input token
         - self.target_dim: dimension of target (prediction output)
         
+        Optional attributes subclasses can set:
+        - self.pad_value: Value for padding missing keys/dimensions (default: np.nan)
+                          Set to 0.0 to use zeros instead of NaN for padding.
+        - self.input_keys: List of input keys to use (filters auto-fill)
+        
         Note: Subclasses can optionally set these properties manually if needed.
         """
         raise NotImplementedError("Subclasses should implement this method.")
+    
+    def _fill_missing_keys(self):
+        """
+        Automatically detect all keys across all trajectories and fill missing keys with pad_value.
+        
+        This enables automatic handling of trajectories with different available tokens.
+        For example, if trajectory A has ['position', 'velocity'] and trajectory B has 
+        only ['position'], trajectory B will get a 'velocity' key filled with pad_value.
+        
+        If pad_value is NaN (default):
+        1. Values are ignored during normalization stats computation (using nanmean/nanstd)
+        2. Replaced with zeros during __getitem__
+        3. Masked out in attention via state_mask
+        
+        If pad_value is 0.0:
+        1. Values are included in normalization stats computation
+        2. No automatic masking is applied
+        
+        Handles both:
+        - Flat format: keys at trajectory root level
+        - Legacy format: keys inside 'observations' dict
+        """
+        if len(self.trajectories) == 0:
+            return
+        
+        first_traj = self.trajectories[0]
+        
+        # Determine if using legacy format
+        is_legacy = 'observations' in first_traj and 'actions' in first_traj
+        
+        if is_legacy and isinstance(first_traj.get('observations'), dict):
+            # Legacy format with dict observations
+            self._fill_missing_keys_legacy_dict(self.pad_value)
+        elif is_legacy:
+            # Legacy format with array observations - no missing keys possible
+            return
+        else:
+            # Flat format
+            self._fill_missing_keys_flat(self.pad_value)
+    
+    def _fill_missing_keys_flat(self, pad_value):
+        """Fill missing keys for flat format trajectories.
+        
+        Args:
+            pad_value: Value to use for padding (np.nan or 0.0)
+        
+        Only fills keys that are in self.input_keys (if specified).
+        If self.input_keys is None, infers input keys as all keys except target_key.
+        """
+        # Determine which keys we care about first
+        if self.input_keys is not None:
+            # Only consider explicitly specified input keys
+            keys_to_consider = set(self.input_keys)
+        else:
+            # If not specified, we'll consider all keys except target_key
+            # Collect all unique keys first
+            all_unique_keys = set()
+            for traj in self.trajectories:
+                for key, value in traj.items():
+                    if isinstance(value, np.ndarray) and len(value.shape) >= 2:
+                        all_unique_keys.add(key)
+            keys_to_consider = all_unique_keys - {self.target_key}
+        
+        # Collect dimensions only for keys we care about, and validate consistency
+        keys_to_fill: Dict[str, int] = {}  # key -> dimension
+        
+        for traj in self.trajectories:
+            for key, value in traj.items():
+                if key not in keys_to_consider:
+                    continue  # Skip keys we don't care about
+                if isinstance(value, np.ndarray) and len(value.shape) >= 2:
+                    dim = value.shape[-1]
+                    if key in keys_to_fill:
+                        if keys_to_fill[key] != dim:
+                            raise ValueError(
+                                f"Inconsistent dimension for key '{key}': "
+                                f"found {dim}, expected {keys_to_fill[key]}"
+                            )
+                    else:
+                        keys_to_fill[key] = dim
+        
+        # Fill missing keys with NaN
+        n_filled = 0
+        for traj in self.trajectories:
+            traj_len = None
+            # Get trajectory length from any existing key
+            for key, value in traj.items():
+                if isinstance(value, np.ndarray) and len(value.shape) >= 2:
+                    traj_len = value.shape[0]
+                    break
+            
+            if traj_len is None:
+                continue
+            
+            for key, dim in keys_to_fill.items():
+                if key not in traj:
+                    # Fill with pad_value
+                    traj[key] = np.full((traj_len, dim), pad_value, dtype=np.float32)
+                    n_filled += 1
+        
+        if n_filled > 0:
+            pad_str = "NaN" if np.isnan(pad_value) else str(pad_value)
+            print(f"Auto-filled {n_filled} missing keys with {pad_str} across {len(self.trajectories)} trajectories")
+            print(f"  Keys considered for auto-fill: {list(keys_to_fill.keys())}")
+    
+    def _fill_missing_keys_legacy_dict(self, pad_value):
+        """Fill missing keys for legacy format with dict observations.
+        
+        Args:
+            pad_value: Value to use for padding (np.nan or 0.0)
+        
+        Only fills keys that are in self.input_keys (if specified).
+        For legacy format, input_keys refers to observation keys.
+        """
+        # Determine which keys we care about first
+        if self.input_keys is not None:
+            # Only consider explicitly specified input keys
+            keys_to_consider = set(self.input_keys)
+        else:
+            # If not specified, collect all unique observation keys
+            keys_to_consider = set()
+            for traj in self.trajectories:
+                obs = traj.get('observations', {})
+                if isinstance(obs, dict):
+                    for key, value in obs.items():
+                        if isinstance(value, np.ndarray):
+                            keys_to_consider.add(key)
+        
+        # Collect dimensions only for keys we care about, and validate consistency
+        keys_to_fill: Dict[str, int] = {}  # key -> dimension
+        
+        for traj in self.trajectories:
+            obs = traj.get('observations', {})
+            if not isinstance(obs, dict):
+                continue
+            
+            for key, value in obs.items():
+                if key not in keys_to_consider:
+                    continue  # Skip keys we don't care about
+                if isinstance(value, np.ndarray):
+                    dim = value.shape[-1] if len(value.shape) >= 2 else 1
+                    if key in keys_to_fill:
+                        if keys_to_fill[key] != dim:
+                            raise ValueError(
+                                f"Inconsistent dimension for observation key '{key}': "
+                                f"found {dim}, expected {keys_to_fill[key]}"
+                            )
+                    else:
+                        keys_to_fill[key] = dim
+        
+        # Fill missing observation keys with NaN
+        n_filled = 0
+        for traj in self.trajectories:
+            obs = traj.get('observations', {})
+            if not isinstance(obs, dict):
+                continue
+            
+            # Get trajectory length from any existing observation
+            traj_len = None
+            for key, value in obs.items():
+                if isinstance(value, np.ndarray):
+                    traj_len = value.shape[0]
+                    break
+            
+            if traj_len is None:
+                continue
+            
+            for key, dim in keys_to_fill.items():
+                if key not in obs:
+                    # Fill with pad_value
+                    obs[key] = np.full((traj_len, dim), pad_value, dtype=np.float32)
+                    n_filled += 1
+        
+        if n_filled > 0:
+            pad_str = "NaN" if np.isnan(pad_value) else str(pad_value)
+            print(f"Auto-filled {n_filled} missing observation keys with {pad_str} across {len(self.trajectories)} trajectories")
+            print(f"  Keys considered for auto-fill: {list(keys_to_fill.keys())}")
+    
+    def _pad_target_to_max_dim(self):
+        """
+        Pad target arrays to have the same dimension across all trajectories.
+        
+        If trajectories have targets with different dimensions, this method pads
+        smaller targets with pad_value to match the maximum dimension found.
+        
+        For example, if trajectory A has target dim 3 and trajectory B has target dim 5,
+        trajectory A's target will be padded with pad_value to have dim 5.
+        
+        Uses self.pad_value (np.nan by default, or 0.0 if configured).
+        
+        Handles both:
+        - Flat format: target at trajectory root level (self.target_key)
+        - Legacy format: 'actions' key
+        """
+        if len(self.trajectories) == 0:
+            return
+        
+        first_traj = self.trajectories[0]
+        
+        # Determine the target key based on format
+        is_legacy = 'observations' in first_traj and 'actions' in first_traj
+        target_key = 'actions' if is_legacy else self.target_key
+        
+        if target_key is None:
+            return
+        
+        # Find the maximum target dimension across all trajectories
+        max_dim = 0
+        for traj in self.trajectories:
+            if target_key in traj:
+                target = traj[target_key]
+                if isinstance(target, np.ndarray) and len(target.shape) >= 2:
+                    max_dim = max(max_dim, target.shape[-1])
+        
+        if max_dim == 0:
+            return
+        
+        # Pad targets to max dimension
+        n_padded = 0
+        for traj in self.trajectories:
+            if target_key in traj:
+                target = traj[target_key]
+                if isinstance(target, np.ndarray) and len(target.shape) >= 2:
+                    current_dim = target.shape[-1]
+                    if current_dim < max_dim:
+                        # Pad with pad_value
+                        traj_len = target.shape[0]
+                        pad_width = max_dim - current_dim
+                        padding = np.full((traj_len, pad_width), self.pad_value, dtype=target.dtype)
+                        traj[target_key] = np.concatenate([target, padding], axis=-1)
+                        n_padded += 1
+        
+        if n_padded > 0:
+            pad_str = "NaN" if np.isnan(self.pad_value) else str(self.pad_value)
+            print(f"Padded {n_padded} targets with {pad_str} to max dimension {max_dim}")
     
     def _detect_and_normalize_format(self):
         """
@@ -319,6 +597,7 @@ class TrajectoryDataset(Dataset):
         """
         Compute normalization statistics for the dataset.
         Handles both flat format and legacy formats.
+        Uses nanmean/nanstd to ignore NaN values (missing tokens).
         """
         if len(self.trajectories) == 0:
             raise ValueError("No trajectories found in dataset")
@@ -340,8 +619,9 @@ class TrajectoryDataset(Dataset):
                 self.input_std = {}
                 for name in self.input_token_names:
                     states_concat = np.concatenate(states_dict[name], axis=0)
-                    self.input_mean[name] = np.mean(states_concat, axis=0)
-                    self.input_std[name] = np.std(states_concat, axis=0) + 1e-6
+                    # Use nanmean/nanstd to handle missing tokens (NaN values)
+                    self.input_mean[name] = np.nanmean(states_concat, axis=0)
+                    self.input_std[name] = np.nanstd(states_concat, axis=0) + 1e-6
             else:
                 # Legacy tensor observations
                 states = []
@@ -349,8 +629,8 @@ class TrajectoryDataset(Dataset):
                     states.append(traj['observations'])
                 
                 states = np.concatenate(states, axis=0)
-                self.input_mean = np.mean(states, axis=0)
-                self.input_std = np.std(states, axis=0) + 1e-6
+                self.input_mean = np.nanmean(states, axis=0)
+                self.input_std = np.nanstd(states, axis=0) + 1e-6
         else:
             # New flat format: compute stats for each input token
             input_data = {name: [] for name in self.input_token_names}
@@ -362,8 +642,9 @@ class TrajectoryDataset(Dataset):
             self.input_std = {}
             for name in self.input_token_names:
                 data_concat = np.concatenate(input_data[name], axis=0)
-                self.input_mean[name] = np.mean(data_concat, axis=0)
-                self.input_std[name] = np.std(data_concat, axis=0) + 1e-6
+                # Use nanmean/nanstd to handle missing tokens (NaN values)
+                self.input_mean[name] = np.nanmean(data_concat, axis=0)
+                self.input_std[name] = np.nanstd(data_concat, axis=0) + 1e-6
         
         # Backward compatibility: alias state_mean/state_std to input_mean/input_std
         self.state_mean = self.input_mean
@@ -401,9 +682,15 @@ class TrajectoryDataset(Dataset):
                 for name in self.input_token_names:
                     traj[name] = (traj[name] - self.input_mean[name]) / self.input_std[name]
     
-    def _split_train_val(self):
+    def _split_train_val_raw(self):
         """
-        Split trajectories into training and validation sets.
+        Split trajectories into training and validation sets BEFORE normalization.
+        
+        This method should be called before _normalize_trajectories() to ensure
+        validation trajectories remain in their raw (unnormalized) form. This is
+        important because validation through TransformerInference.step() applies
+        normalization, so validation data must be unnormalized to properly test
+        the full inference pipeline.
         
         The split can be specified as:
         - float (0.0-1.0): fraction of trajectories for validation
@@ -411,6 +698,9 @@ class TrajectoryDataset(Dataset):
         
         Trajectories are shuffled before splitting to ensure randomness.
         Results are stored in self.trajectories (train) and self.val_trajectories (val).
+        
+        Note: Validation trajectories are deep-copied to prevent them from being
+        modified when training trajectories are normalized in-place.
         """
         if self.val_split is None or self.val_split == 0:
             self.val_trajectories = []
@@ -439,7 +729,6 @@ class TrajectoryDataset(Dataset):
             n_val = total_trajs - 1
         
         # Shuffle trajectories for random split
-        import random
         random.seed(42)  # For reproducibility
         indices = list(range(total_trajs))
         random.shuffle(indices)
@@ -448,12 +737,13 @@ class TrajectoryDataset(Dataset):
         val_indices = set(indices[:n_val])
         train_indices = set(indices[n_val:])
         
-        # Split trajectories
-        self.val_trajectories = [self.trajectories[i] for i in sorted(val_indices)]
+        # Deep copy validation trajectories to keep them unnormalized
+        # when training trajectories are normalized in-place later
+        self.val_trajectories = [copy.deepcopy(self.trajectories[i]) for i in sorted(val_indices)]
         train_trajectories = [self.trajectories[i] for i in sorted(train_indices)]
         self.trajectories = train_trajectories
         
-        print(f"Split dataset: {len(self.trajectories)} training trajectories, {len(self.val_trajectories)} validation trajectories")
+        print(f"Split dataset: {len(self.trajectories)} training trajectories, {len(self.val_trajectories)} validation trajectories (raw/unnormalized)")
     
     def _validate_dataset(self):
         """
@@ -534,6 +824,11 @@ class TrajectoryDataset(Dataset):
         Create and return a validation dataset using the validation trajectories.
         Returns None if no validation split was configured.
         
+        IMPORTANT: Validation trajectories are stored in their raw (unnormalized) form
+        to properly test the full inference pipeline when using TransformerInference.step().
+        This dataset is intended for use with the inference wrapper, NOT for direct
+        iteration (which would give unnormalized data).
+        
         The validation dataset shares the same normalization stats as the training set.
         """
         if not hasattr(self, 'val_trajectories') or len(self.val_trajectories) == 0:
@@ -611,6 +906,17 @@ class TrajectoryDataset(Dataset):
     _get_target = get_target
 
     def __getitem__(self, idx):
+        """
+        Get a trajectory sample for training.
+        
+        Returns:
+            timesteps: Tensor of shape (T,) with timestep indices
+            states: Dict of tensors, each (T, dim), or tensor (T, state_dim) for legacy format
+            target: Tensor of shape (T, act_dim)
+            traj_mask: Tensor of shape (T,) indicating valid timesteps (1) vs padding (0)
+            state_mask: Dict of tensors, each (T,) indicating valid (True) vs missing (False) tokens.
+                       None if no missing tokens detected. Missing tokens are detected via NaN values.
+        """
         traj = self.trajectories[idx]
         dtype = torch.float32
         
@@ -630,14 +936,36 @@ class TrajectoryDataset(Dataset):
             if is_dict_inputs and not is_single_tensor:
                 # Dictionary format: slice each input token separately
                 states = {}
+                state_mask = {}
+                has_missing = False
+                
                 for key, value in inputs.items():
-                    states[key] = torch.from_numpy(value[si : si + self.context_len]).to(dtype)
+                    sliced = value[si : si + self.context_len]
+                    
+                    # Detect NaN values to create mask (NaN = missing token)
+                    # Check if any value in each timestep is NaN
+                    nan_mask = np.isnan(sliced).any(axis=-1)  # (T,)
+                    
+                    if nan_mask.any():
+                        has_missing = True
+                        # Replace NaN with zeros for the tensor
+                        sliced = np.nan_to_num(sliced, nan=0.0)
+                        state_mask[key] = torch.from_numpy(~nan_mask)  # True = valid, False = missing
+                    else:
+                        state_mask[key] = torch.ones(self.context_len, dtype=torch.bool)
+                    
+                    states[key] = torch.from_numpy(sliced).to(dtype)
+                
+                # Only keep state_mask if there are missing tokens
+                # if not has_missing:
+                #     state_mask = None
             else:
                 # Legacy array format (possibly wrapped in dict)
                 obs_data = inputs['observations'] if is_single_tensor else inputs
                 states = torch.from_numpy(obs_data[si : si + self.context_len]).to(dtype)
+                # state_mask = None
             
-            actions = torch.from_numpy(target[si : si + self.context_len]).to(dtype)
+            target = torch.from_numpy(target[si : si + self.context_len]).to(dtype)
             timesteps = torch.arange(start=si, end=si+self.context_len, step=1)
 
             # all ones since no padding
@@ -649,13 +977,40 @@ class TrajectoryDataset(Dataset):
             if is_dict_inputs and not is_single_tensor:
                 # Dictionary format: pad each input token separately
                 states = {}
+                state_mask = {}
+                has_missing = False
+                
                 for key, value in inputs.items():
+                    # Detect NaN values to create mask
+                    nan_mask = np.isnan(value).any(axis=-1)  # (traj_len,)
+                    
+                    if nan_mask.any():
+                        has_missing = True
+                        # Replace NaN with zeros
+                        value = np.nan_to_num(value, nan=0.0)
+                        # Mask: True for valid, False for missing/padding
+                        valid_mask = torch.from_numpy(~nan_mask)
+                        state_mask[key] = torch.cat([valid_mask,
+                                                     torch.zeros(padding_len, dtype=torch.bool)],
+                                                    dim=0)
+                    else:
+                        # All valid for data portion, zeros (invalid) for padding
+                        state_mask[key] = torch.cat([torch.ones(traj_len, dtype=torch.bool),
+                                                     torch.zeros(padding_len, dtype=torch.bool)],
+                                                    dim=0)
+                    
                     state_tensor = torch.from_numpy(value).to(dtype)
                     padded_state = torch.cat([state_tensor,
                                             torch.zeros(([padding_len] + list(state_tensor.shape[1:])),
                                             dtype=dtype)],
                                            dim=0)
                     states[key] = padded_state
+                
+                # For padded sequences, we always need the mask (padding creates "missing" tokens)
+                # But we only need to pass it if there are actual missing tokens in the data
+                # since traj_mask already handles padding for the loss
+                # if not has_missing:
+                #     state_mask = None
             else:
                 # Legacy array format (possibly wrapped in dict)
                 obs_data = inputs['observations'] if is_single_tensor else inputs
@@ -665,9 +1020,9 @@ class TrajectoryDataset(Dataset):
                                     dtype=dtype)],
                                    dim=0)
 
-            actions = torch.from_numpy(target).to(dtype)
-            actions = torch.cat([actions,
-                                torch.zeros(([padding_len] + list(actions.shape[1:])),
+            target = torch.from_numpy(target).to(dtype)
+            target = torch.cat([target,
+                                torch.zeros(([padding_len] + list(target.shape[1:])),
                                 dtype=dtype)],
                                dim=0)
 
@@ -678,7 +1033,7 @@ class TrajectoryDataset(Dataset):
                                   dim=0)
 
         # B, T = 1, self.context_len
-        return  timesteps, self._reshape_states(states), actions, traj_mask
+        return  timesteps, self._reshape_states(states), target, traj_mask, state_mask
 
 
 
