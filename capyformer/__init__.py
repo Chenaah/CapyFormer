@@ -12,7 +12,18 @@ from capyformer.rnn_trainer import RNNTrainer
 
 # HuggingFace trainer (optional, requires transformers package)
 try:
-    from capyformer.hf_trainer import HFTrainer, HFTrajectoryModel, HFTransformerInference
+    from capyformer.hf_trainer import (
+        HFTrainer, 
+        HFTrajectoryModel, 
+        HFTransformerInference,
+        HFFlowMatchingInference,
+        FlowMatchingHead,
+        # Action Chunking (non-autoregressive, MPC-style like pi0)
+        HFActionChunkingTrainer,
+        HFActionChunkingModel,
+        ActionChunkingInference,
+        ActionChunkingHead,
+    )
     HAS_HF_TRAINER = True
 except ImportError:
     HAS_HF_TRAINER = False
@@ -31,5 +42,12 @@ __all__ = [
     "HFTrainer",
     "HFTrajectoryModel",
     "HFTransformerInference",
+    "HFFlowMatchingInference",
+    "FlowMatchingHead",
+    # Action Chunking (non-autoregressive, MPC-style)
+    "HFActionChunkingTrainer",
+    "HFActionChunkingModel",
+    "ActionChunkingInference",
+    "ActionChunkingHead",
     "HAS_HF_TRAINER",
 ]
