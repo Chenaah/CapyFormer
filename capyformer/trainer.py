@@ -260,6 +260,103 @@ class Trainer():
         print(f"Model loaded successfully from {path}")
         return self
     
+    @classmethod
+    def from_checkpoint(cls, path: str, device: str = "cuda:0"):
+        """
+        Load a Trainer from a checkpoint file (class method - no instance needed).
+        
+        This is the recommended way to load a model for inference without training.
+        
+        Args:
+            path: Path to the checkpoint file (.pt).
+            device: Device to load the model to.
+        
+        Returns:
+            Trainer instance with loaded model, ready for inference.
+        
+        Example:
+            trainer = Trainer.from_checkpoint("./models/my_model.pt")
+            inference = trainer.get_inference()
+            
+            for t in range(episode_length):
+                state = {'position': pos, 'velocity': vel}
+                prediction = inference.step(state)
+        """
+        if not path.endswith(".pt"):
+            path = f"{path}.pt"
+        
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"No checkpoint found at {path}")
+        
+        print(f"Loading checkpoint from {path}")
+        checkpoint = torch.load(path, map_location=device)
+        
+        config = checkpoint["model_config"]
+        trainer_config = checkpoint.get("trainer_config", {})
+        
+        # Get state stats from checkpoint
+        state_mean = config.get("state_mean")
+        state_std = config.get("state_std")
+        
+        if state_mean is None or state_std is None:
+            raise ValueError(
+                "Checkpoint missing state_mean/state_std. "
+                "Use trainer.load() with a dataset instead."
+            )
+        
+        # Create a minimal Trainer instance without a dataset
+        # We use object.__new__ to bypass __init__ which requires a dataset
+        trainer = object.__new__(cls)
+        
+        # Set essential attributes
+        trainer.traj_dataset = None
+        trainer.act_dim = config["act_dim"]
+        trainer.state_token_dims = config["state_token_dims"]
+        trainer.log_dir = os.path.dirname(path) or "."
+        trainer.context_len = config["context_len"]
+        trainer.use_action_tanh = config.get("use_action_tanh", False)
+        trainer.shared_state_embedding = config.get("shared_state_embedding", True)
+        trainer.device = device
+        trainer.n_blocks = config["n_blocks"]
+        trainer.h_dim = config["h_dim"]
+        trainer.n_heads = config["n_heads"]
+        trainer.drop_p = config["drop_p"]
+        trainer.action_is_velocity = trainer_config.get("action_is_velocity", True)
+        trainer.dt = trainer_config.get("dt", 0.02)
+        
+        # Set other attributes to defaults (not needed for inference)
+        trainer.wandb_on = False
+        trainer.load_run = None
+        trainer.batch_size = 256
+        trainer.learning_rate = 1e-4
+        trainer.wt_decay = 0.005
+        trainer.warmup_steps = 10000
+        trainer.seed = 0
+        trainer.validation_freq = 100
+        trainer.validation_trajectories = 10
+        
+        # Reconstruct the model
+        trainer.model = Transformer(
+            state_token_dims=config["state_token_dims"],
+            state_token_names=config.get("state_token_names"),
+            act_dim=config["act_dim"],
+            n_blocks=config["n_blocks"],
+            h_dim=config["h_dim"],
+            context_len=config["context_len"],
+            n_heads=config["n_heads"],
+            drop_p=config["drop_p"],
+            state_mean=state_mean,
+            state_std=state_std,
+            shared_state_embedding=config.get("shared_state_embedding", True),
+            use_action_tanh=config.get("use_action_tanh", False),
+        ).to(device)
+        
+        trainer.model.load_state_dict(checkpoint["model_state_dict"])
+        trainer.model.eval()
+        
+        print(f"Model loaded successfully from {path}")
+        return trainer
+    
     @staticmethod
     def load_torchscript(path: str, device: str = "cuda:0"):
         """

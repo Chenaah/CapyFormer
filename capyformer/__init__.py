@@ -28,6 +28,19 @@ try:
 except ImportError:
     HAS_HF_TRAINER = False
 
+# Sanity check utilities (optional import to avoid dependencies)
+try:
+    from capyformer.sanity_check import (
+        ToyLinearDataset,
+        ToyModularDataset,
+        ToyPeriodicDataset,
+        ToyEnvironment,
+        ToyModularEnvironment,
+    )
+    HAS_SANITY_CHECK = True
+except ImportError:
+    HAS_SANITY_CHECK = False
+
 __all__ = [
     "Transformer",
     "TransformerInference",
@@ -50,4 +63,11 @@ __all__ = [
     "ActionChunkingInference",
     "ActionChunkingHead",
     "HAS_HF_TRAINER",
+    # Sanity check utilities
+    "ToyLinearDataset",
+    "ToyModularDataset",
+    "ToyPeriodicDataset",
+    "ToyEnvironment",
+    "ToyModularEnvironment",
+    "HAS_SANITY_CHECK",
 ]

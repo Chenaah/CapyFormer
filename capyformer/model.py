@@ -509,7 +509,10 @@ class TransformerInference:
                 if mean.device != value.device:
                     mean = mean.to(value.device)
                     std = std.to(value.device)
-                
+                try:
+                    value - mean
+                except:
+                    import pdb; pdb.set_trace()
                 return (value - mean) / std
         
         # No normalization available

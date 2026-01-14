@@ -1282,7 +1282,7 @@ class HFTrainer:
     def __init__(
         self,
         dataset: TrajectoryDataset,
-        model_name: str = "google/gemma-2b",
+        model_name: str = "google/gemma-3-270m",
         log_dir: str = "./logs",
         use_lora: bool = True,
         lora_r: int = 16,
@@ -1509,6 +1509,120 @@ class HFTrainer:
         if self.use_flow_matching:
             print(f"  Flow Matching enabled ({self.flow_matching_steps} steps)")
         return self
+    
+    @classmethod
+    def from_checkpoint(cls, path: str, device: str = "cuda:0"):
+        """
+        Load an HFTrainer from a checkpoint file (class method - no instance needed).
+        
+        This is the recommended way to load a model for inference without training.
+        
+        Args:
+            path: Path to the checkpoint file (.pt).
+            device: Device to load the model to.
+        
+        Returns:
+            HFTrainer instance with loaded model, ready for inference.
+        
+        Example:
+            trainer = HFTrainer.from_checkpoint("./models/my_model.pt")
+            inference = trainer.get_inference()
+            
+            for t in range(episode_length):
+                state = {'position': pos, 'velocity': vel}
+                prediction = inference.step(state)
+        """
+        if not path.endswith(".pt"):
+            path = f"{path}.pt"
+        
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"No checkpoint found at {path}")
+        
+        print(f"Loading checkpoint from {path}")
+        checkpoint = torch.load(path, map_location=device)
+        
+        config = checkpoint["model_config"]
+        trainer_config = checkpoint.get("trainer_config", {})
+        
+        # Get state stats from checkpoint
+        state_mean = config.get("state_mean")
+        state_std = config.get("state_std")
+        
+        if state_mean is None or state_std is None:
+            raise ValueError(
+                "Checkpoint missing state_mean/state_std. "
+                "Use trainer.load() with a dataset instead."
+            )
+        
+        # Create a minimal HFTrainer instance without a dataset
+        trainer = object.__new__(cls)
+        
+        # Set essential attributes from checkpoint
+        trainer.traj_dataset = None
+        trainer.model_name = config["model_name"]
+        trainer.log_dir = os.path.dirname(path) or "."
+        trainer.act_dim = config["target_dim"]
+        trainer.state_token_dims = config["input_token_dims"]
+        trainer.state_token_names = config["input_token_names"]
+        trainer.context_len = config["context_len"]
+        trainer.use_action_tanh = config.get("use_action_tanh", False)
+        trainer.use_flow_matching = config.get("use_flow_matching", False)
+        trainer.flow_matching_steps = config.get("flow_matching_steps", 10)
+        trainer.device = device
+        
+        # Set trainer config
+        trainer.action_is_velocity = trainer_config.get("action_is_velocity", True)
+        trainer.dt = trainer_config.get("dt", 0.02)
+        trainer.use_lora = trainer_config.get("use_lora", False)
+        trainer.lora_r = trainer_config.get("lora_r", 16)
+        trainer.lora_alpha = trainer_config.get("lora_alpha", 32)
+        
+        # Set other attributes to defaults (not needed for inference)
+        trainer.lora_dropout = 0.05
+        trainer.freeze_backbone = True
+        trainer.load_in_8bit = False
+        trainer.load_in_4bit = False
+        trainer.batch_size = 32
+        trainer.learning_rate = 1e-4
+        trainer.wt_decay = 0.01
+        trainer.warmup_steps = 1000
+        trainer.seed = 0
+        trainer.validation_freq = 100
+        trainer.validation_trajectories = 10
+        
+        # Load HF model backbone
+        print(f"Loading HuggingFace model: {trainer.model_name}")
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            trainer.model_name,
+            torch_dtype=torch.float32,
+            trust_remote_code=True,
+        )
+        
+        hidden_dim = hf_model.config.hidden_size
+        
+        # Create wrapper model
+        trainer.model = HFTrajectoryModel(
+            hf_model=hf_model,
+            input_token_dims=trainer.state_token_dims,
+            input_token_names=trainer.state_token_names,
+            target_dim=trainer.act_dim,
+            hidden_dim=hidden_dim,
+            use_action_tanh=trainer.use_action_tanh,
+            use_flow_matching=trainer.use_flow_matching,
+            flow_matching_steps=trainer.flow_matching_steps,
+            state_mean=state_mean,
+            state_std=state_std,
+        )
+        
+        trainer.model.load_state_dict(checkpoint["model_state_dict"])
+        trainer.model.to(device)
+        trainer.model.eval()
+        
+        print(f"Model loaded successfully from {path}")
+        if trainer.use_flow_matching:
+            print(f"  Flow Matching enabled ({trainer.flow_matching_steps} steps)")
+        
+        return trainer
     
     def validate_rollout(self, model, device):
         """Validate by performing trajectory rollouts."""
@@ -1763,7 +1877,7 @@ class HFActionChunkingTrainer:
     def __init__(
         self,
         dataset: TrajectoryDataset,
-        model_name: str = "google/gemma-2b",
+        model_name: str = "google/gemma-3-270m",
         log_dir: str = "./logs",
         action_horizon: int = 16,
         execute_horizon: int = 1,
@@ -2016,6 +2130,123 @@ class HFActionChunkingTrainer:
             print(f"  Flow Matching enabled ({self.flow_matching_steps} steps)")
         
         return self
+    
+    @classmethod
+    def from_checkpoint(cls, path: str, device: str = "cuda:0"):
+        """
+        Load an HFActionChunkingTrainer from a checkpoint file (class method - no instance needed).
+        
+        This is the recommended way to load a model for inference without training.
+        
+        Args:
+            path: Path to the checkpoint file (.pt).
+            device: Device to load the model to.
+        
+        Returns:
+            HFActionChunkingTrainer instance with loaded model, ready for inference.
+        
+        Example:
+            trainer = HFActionChunkingTrainer.from_checkpoint("./models/my_model.pt")
+            inference = trainer.get_inference()
+            
+            for t in range(episode_length):
+                state = {'position': pos, 'velocity': vel}
+                action = inference.step(state)
+        """
+        if not path.endswith(".pt"):
+            path = f"{path}.pt"
+        
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"No checkpoint found at {path}")
+        
+        print(f"Loading checkpoint from {path}")
+        checkpoint = torch.load(path, map_location=device)
+        
+        model_config = checkpoint["model_config"]
+        trainer_config = checkpoint.get("trainer_config", {})
+        
+        # Get state stats from checkpoint
+        state_mean = model_config.get("state_mean")
+        state_std = model_config.get("state_std")
+        
+        if state_mean is None or state_std is None:
+            raise ValueError(
+                "Checkpoint missing state_mean/state_std. "
+                "Use trainer.load() with a dataset instead."
+            )
+        
+        # Create a minimal HFActionChunkingTrainer instance without a dataset
+        trainer = object.__new__(cls)
+        
+        # Set essential attributes from checkpoint
+        trainer.traj_dataset = None
+        trainer.model_name = model_config["model_name"]
+        trainer.log_dir = os.path.dirname(path) or "."
+        trainer.act_dim = model_config["target_dim"]
+        trainer.state_token_dims = model_config["input_token_dims"]
+        trainer.state_token_names = model_config["input_token_names"]
+        trainer.context_len = model_config["context_len"]
+        trainer.action_horizon = model_config["action_horizon"]
+        trainer.use_flow_matching = model_config.get("use_flow_matching", False)
+        trainer.flow_matching_steps = model_config.get("flow_matching_steps", 10)
+        trainer.device = device
+        
+        # Set trainer config
+        trainer.execute_horizon = trainer_config.get("execute_horizon", 1)
+        trainer.action_is_velocity = trainer_config.get("action_is_velocity", True)
+        trainer.dt = trainer_config.get("dt", 0.02)
+        
+        # Set other attributes to defaults (not needed for inference)
+        trainer.use_lora = False
+        trainer.lora_r = 16
+        trainer.lora_alpha = 32
+        trainer.lora_dropout = 0.05
+        trainer.freeze_backbone = True
+        trainer.load_in_8bit = False
+        trainer.load_in_4bit = False
+        trainer.batch_size = 32
+        trainer.learning_rate = 1e-4
+        trainer.wt_decay = 0.01
+        trainer.warmup_steps = 1000
+        trainer.seed = 0
+        trainer.validation_freq = 100
+        trainer.validation_trajectories = 10
+        
+        # Load HF model backbone
+        print(f"Loading HuggingFace model: {trainer.model_name}")
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            trainer.model_name,
+            torch_dtype=torch.float32,
+            trust_remote_code=True,
+        )
+        
+        hidden_dim = hf_model.config.hidden_size
+        
+        # Create Action Chunking model
+        trainer.model = HFActionChunkingModel(
+            hf_model=hf_model,
+            input_token_dims=trainer.state_token_dims,
+            input_token_names=trainer.state_token_names,
+            target_dim=trainer.act_dim,
+            hidden_dim=hidden_dim,
+            action_horizon=trainer.action_horizon,
+            use_flow_matching=trainer.use_flow_matching,
+            flow_matching_steps=trainer.flow_matching_steps,
+            state_mean=state_mean,
+            state_std=state_std,
+        )
+        
+        trainer.model.load_state_dict(checkpoint["model_state_dict"])
+        trainer.model.to(device)
+        trainer.model.eval()
+        
+        print(f"Model loaded successfully from {path}")
+        print(f"  Action horizon: {trainer.action_horizon}")
+        print(f"  Execute horizon: {trainer.execute_horizon}")
+        if trainer.use_flow_matching:
+            print(f"  Flow Matching enabled ({trainer.flow_matching_steps} steps)")
+        
+        return trainer
     
     def validate_rollout(self, model, device):
         """
