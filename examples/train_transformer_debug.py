@@ -94,6 +94,12 @@ def evaluate_robot_rollout(trainer, epoch, n_steps=500, seed=42):
     cfg = ConfigRegistry.create_from_name("modular_quadruped")
     cfg.control.default_dof_pos = [0, 0, 0, 0, 0]
     
+    # Explicitly set initialization pose to avoid collapsed start (since default_dof_pos is 0)
+    if 'initialization' not in cfg:
+        from omegaconf import OmegaConf
+        cfg['initialization'] = OmegaConf.create()
+    cfg.initialization.init_joint_pos = [0, -1., 1., 1., -1.]
+    
     cfg.simulation.render = True
     cfg.simulation.render_mode = "mp4"
     cfg.simulation.video_record_interval = 1  # Record every episode
@@ -240,7 +246,7 @@ def main():
             log_dir=args.log_dir,
             batch_size=args.batch_size,
             learning_rate=args.lr,
-            validation_freq=10,  # More frequent validation
+            validation_freq=100,  # More frequent validation
             action_is_velocity=True,
             validation_callback=robot_validation_callback if args.robot_validation else None,
         )
