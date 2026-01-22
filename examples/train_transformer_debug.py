@@ -17,6 +17,7 @@ import time
 import os
 
 from capyformer import HFActionChunkingTrainer, TrajectoryDataset
+from capyformer.trainer import Trainer
 
 DEFAULT_ROLLOUT_PATH = "batch_rollouts.pkl"
 DEFAULT_LOG_DIR = "./debug/transformer_debug"
@@ -182,6 +183,8 @@ def main():
                         help="Run robot rollout validation with video recording")
     parser.add_argument("--robot-val-steps", type=int, default=500,
                         help="Number of steps for robot validation")
+    parser.add_argument("--use-simple-trainer", action="store_true",
+                        help="Use the simple Trainer instead of HFActionChunkingTrainer")
     args = parser.parse_args()
     
     # Create log directory
@@ -191,6 +194,7 @@ def main():
     print("DEBUG TRAINING FOR TRANSFORMER POLICY")
     print("=" * 70)
     print(f"Settings:")
+    print(f"  Trainer: {'Trainer (simple)' if args.use_simple_trainer else 'HFActionChunkingTrainer'}")
     print(f"  Flow matching: {not args.no_flow_matching}")
     print(f"  Action horizon: {args.action_horizon}")
     print(f"  Context length: {args.context_len}")
@@ -204,32 +208,44 @@ def main():
     DatasetClass = create_dataset_class(args.rollout_path)
     dataset = DatasetClass({"val_split": 0.1}, context_len=args.context_len)
     
-    # Create trainer with debug-friendly settings
-    trainer = HFActionChunkingTrainer(
-        dataset,
-        model_name="google/gemma-3-270m",
-        log_dir=args.log_dir,
-        
-        # Simpler settings for debugging
-        action_horizon=args.action_horizon,
-        execute_horizon=1,
-        
-        # No flow matching for cleaner debugging
-        use_flow_matching=not args.no_flow_matching,
-        flow_matching_steps=10 if not args.no_flow_matching else 0,
-        
-        use_lora=False,
-        freeze_backbone=False,
-        
-        batch_size=args.batch_size,
-        learning_rate=args.lr,
-        validation_freq=10,  # More frequent validation
-        action_is_velocity=True,
-    )
+    # Create trainer based on selection
+    if args.use_simple_trainer:
+        # Use the simpler Trainer from trainer.py
+        trainer = Trainer(
+            dataset,
+            log_dir=args.log_dir,
+            batch_size=args.batch_size,
+            learning_rate=args.lr,
+            validation_freq=10,  # More frequent validation
+            action_is_velocity=True,
+        )
+    else:
+        # Use HFActionChunkingTrainer with debug-friendly settings
+        trainer = HFActionChunkingTrainer(
+            dataset,
+            model_name="google/gemma-3-270m",
+            log_dir=args.log_dir,
+            
+            # Simpler settings for debugging
+            action_horizon=args.action_horizon,
+            execute_horizon=1,
+            
+            # No flow matching for cleaner debugging
+            use_flow_matching=not args.no_flow_matching,
+            flow_matching_steps=10 if not args.no_flow_matching else 0,
+            
+            use_lora=False,
+            freeze_backbone=False,
+            
+            batch_size=args.batch_size,
+            learning_rate=args.lr,
+            validation_freq=10,  # More frequent validation
+            action_is_velocity=True,
+        )
     
     # Train in phases and check per-joint progress
     epochs_trained = 0
-    phase_epochs = [50, 100, 200, args.n_epochs]
+    phase_epochs = [500, 1000, 2000, args.n_epochs]
     
     for epoch_target in phase_epochs:
         if epoch_target > args.n_epochs:

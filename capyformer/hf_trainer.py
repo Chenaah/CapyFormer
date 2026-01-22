@@ -1304,7 +1304,14 @@ class HFTrainer:
         validation_trajectories: int = 10,
         action_is_velocity: bool = True,
         dt: float = 0.02,
+        validation_metric_fn: callable = None,
     ):
+        """
+        validation_metric_fn: Optional custom validation metric function.
+            Should take (predictions: np.ndarray, targets: np.ndarray) and return
+            a tuple (metric_value: float, metric_name: str). If provided, this 
+            metric will be displayed during validation instead of MSE.
+        """
         if not HAS_TRANSFORMERS:
             raise ImportError(
                 "HuggingFace Transformers not installed. "
@@ -1340,6 +1347,7 @@ class HFTrainer:
         self.validation_trajectories = validation_trajectories
         self.action_is_velocity = action_is_velocity
         self.dt = dt
+        self.validation_metric_fn = validation_metric_fn
         
         # Get dataset properties
         self.act_dim = dataset.act_dim
@@ -1625,8 +1633,15 @@ class HFTrainer:
         return trainer
     
     def validate_rollout(self, model, device):
-        """Validate by performing trajectory rollouts."""
+        """Validate by performing trajectory rollouts.
+        
+        Returns:
+            tuple: (metric_value, metric_name) if validation_metric_fn is set,
+                   otherwise (mse_value, "MSE")
+        """
         model.eval()
+        all_predictions = []
+        all_targets = []
         total_mse = 0.0
         num_predictions = 0
         
@@ -1667,16 +1682,28 @@ class HFTrainer:
                     if valid_mask.any():
                         pred_masked = predicted_actions[valid_mask]
                         target_masked = actual_targets[valid_mask]
-                        mse = F.mse_loss(pred_masked, target_masked, reduction='sum')
                         
+                        # Collect for custom metric
+                        all_predictions.append(pred_masked.numpy())
+                        all_targets.append(target_masked.numpy())
+                        
+                        mse = F.mse_loss(pred_masked, target_masked, reduction='sum')
                         total_mse += mse.item()
                         num_predictions += valid_mask.sum().item()
         
         model.train()
         
+        # Use custom metric if provided
+        if self.validation_metric_fn is not None and len(all_predictions) > 0:
+            all_predictions = np.concatenate(all_predictions, axis=0)
+            all_targets = np.concatenate(all_targets, axis=0)
+            metric_value, metric_name = self.validation_metric_fn(all_predictions, all_targets)
+            return metric_value, metric_name
+        
+        # Default: return MSE
         if num_predictions > 0:
-            return total_mse / num_predictions
-        return 0.0
+            return total_mse / num_predictions, "MSE"
+        return 0.0, "MSE"
     
     def learn(self, n_epochs: int = None, save_final: bool = True):
         """
@@ -1833,14 +1860,15 @@ class HFTrainer:
             inner_bar.reset()
             
             # Validation
-            validation_mse = 0.0
+            validation_metric = 0.0
+            metric_name = "MSE"
             if epoch % self.validation_freq == 0:
                 tqdm.write(f"Epoch {epoch}: Validating...")
-                validation_mse = self.validate_rollout(model, device)
-                tqdm.write(f"Validation MSE: {validation_mse:.6f}")
+                validation_metric, metric_name = self.validate_rollout(model, device)
+                tqdm.write(f"Validation {metric_name}: {validation_metric:.6f}")
             
             avg_loss = np.mean(log_losses) if log_losses else 0.0
-            csv_writer.writerow([avg_loss, validation_mse])
+            csv_writer.writerow([avg_loss, validation_metric])
         
         self.model = model
         
