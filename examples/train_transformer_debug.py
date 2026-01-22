@@ -94,46 +94,6 @@ def evaluate_robot_rollout(trainer, epoch, n_steps=500, seed=42):
     cfg = ConfigRegistry.create_from_name("modular_quadruped")
     cfg.control.default_dof_pos = [0, 0, 0, 0, 0]
     
-    # PATCH: Fix observation structure to match training data
-    # Training data (batch_record_rollout.py) uses manual per-module extraction:
-    # [proj_grav, gyro, dof_pos, dof_vel] per module (raw dof_pos, no cos transform)
-    # But modular_quadruped.yaml puts dof_pos/vel in global components with cos transform.
-    if hasattr(cfg.observation, "modular"):
-        # 1. Remove global components dof_pos and dof_vel
-        if hasattr(cfg.observation.modular, "global_components"):
-            # Use OmegaConf for proper list manipulation if it's a config object
-            global_comps = cfg.observation.modular.global_components
-            cfg.observation.modular.global_components = [
-                c for c in global_comps 
-                if (c if isinstance(c, str) else c["name"]) not in ["dof_pos", "dof_vel"]
-            ]
-            
-        # 2. Add to per-module components if not present
-        per_module = cfg.observation.modular.per_module_components
-        # Check current names
-        current_names = [
-            (c if isinstance(c, str) else c["name"]) for c in per_module
-        ]
-        
-        # Add dof_pos (raw, index_type=slice)
-        if "dof_pos" not in current_names:
-            from omegaconf import OmegaConf
-            per_module.append(OmegaConf.create({
-                "name": "dof_pos",
-                "index_type": "slice",
-                "slice_size": 1,
-                # "transform": "cos"  # REMOVED to match batch_record_rollout.py (raw)
-            }))
-        
-        # Add dof_vel (raw, index_type=slice)
-        if "dof_vel" not in current_names:
-            from omegaconf import OmegaConf
-            per_module.append(OmegaConf.create({
-                "name": "dof_vel",
-                "index_type": "slice",
-                "slice_size": 1
-            }))
-            
     cfg.simulation.render = True
     cfg.simulation.render_mode = "mp4"
     cfg.simulation.video_record_interval = 1  # Record every episode
@@ -220,7 +180,7 @@ def main():
                         help="Context length (shorter = simpler)")
     parser.add_argument("--log-dir", type=str, default=DEFAULT_LOG_DIR,
                         help="Directory for logs and videos")
-    parser.add_argument("--robot-validation", action="store_true",
+    parser.add_argument("--robot-validation", default=True, action="store_true",
                         help="Run robot rollout validation with video recording")
     parser.add_argument("--robot-val-steps", type=int, default=500,
                         help="Number of steps for robot validation")
@@ -249,6 +209,29 @@ def main():
     DatasetClass = create_dataset_class(args.rollout_path)
     dataset = DatasetClass({"val_split": 0.1}, context_len=args.context_len)
     
+    
+    # Define validation callback
+    def robot_validation_callback(trainer_instance, epoch_num):
+        """Callback to run robot validation during training."""
+        if not args.robot_validation:
+            return
+            
+        print(f"\n[Robot Validation] Running rollout and recording video for epoch {epoch_num}...")
+        try:
+            metrics = evaluate_robot_rollout(
+                trainer_instance, 
+                epoch=epoch_num, 
+                n_steps=args.robot_val_steps
+            )
+            print(f"  Total reward: {metrics['total_reward']:.2f}")
+            print(f"  Avg reward/step: {metrics['avg_reward']:.4f}")
+            print(f"  Distance traveled: {metrics['distance']:.3f}m")
+            print(f"  Steps completed: {metrics['steps']}")
+        except Exception as e:
+            print(f"  Robot validation failed: {e}")
+            import traceback
+            traceback.print_exc()
+
     # Create trainer based on selection
     if args.use_simple_trainer:
         # Use the simpler Trainer from trainer.py
@@ -259,6 +242,7 @@ def main():
             learning_rate=args.lr,
             validation_freq=10,  # More frequent validation
             action_is_velocity=True,
+            validation_callback=robot_validation_callback if args.robot_validation else None,
         )
     else:
         # Use HFActionChunkingTrainer with debug-friendly settings
@@ -282,48 +266,21 @@ def main():
             learning_rate=args.lr,
             validation_freq=10,  # More frequent validation
             action_is_velocity=True,
+            validation_callback=robot_validation_callback if args.robot_validation else None,
         )
     
-    # Train in phases and check per-joint progress
-    epochs_trained = 0
-    phase_epochs = [500, 1000, 2000, args.n_epochs]
+    # Train in one go, validation callbacks will handle the rest
+    print(f"\n[Training] Training for {args.n_epochs} epochs...")
+    trainer.learn(n_epochs=args.n_epochs)
     
-    for epoch_target in phase_epochs:
-        if epoch_target > args.n_epochs:
-            break
-            
-        epochs_to_train = epoch_target - epochs_trained
-        if epochs_to_train <= 0:
-            continue
-            
-        print(f"\n[Training] Training {epochs_to_train} epochs (total: {epoch_target})...")
-        trainer.learn(n_epochs=epochs_to_train)
-        epochs_trained = epoch_target
-        
-        print(f"\n[Evaluation] After {epoch_target} epochs:")
-        correlations = evaluate_per_joint(trainer, dataset)
-        
-        # Check if any joint has very low correlation
-        if min(correlations) < 0.2:
-            bad_joints = [j for j, c in enumerate(correlations) if c < 0.2]
-            print(f"\n⚠️ WARNING: Joints {bad_joints} have low correlation!")
-            print("   Consider: more epochs, different learning rate, or checking data")
-        
-        # Robot rollout validation with video
-        if args.robot_validation:
-            print(f"\n[Robot Validation] Running rollout and recording video...")
-            try:
-                metrics = evaluate_robot_rollout(
-                    trainer, 
-                    epoch=epoch_target, 
-                    n_steps=args.robot_val_steps
-                )
-                print(f"  Total reward: {metrics['total_reward']:.2f}")
-                print(f"  Avg reward/step: {metrics['avg_reward']:.4f}")
-                print(f"  Distance traveled: {metrics['distance']:.3f}m")
-                print(f"  Steps completed: {metrics['steps']}")
-            except Exception as e:
-                print(f"  Robot validation failed: {e}")
+    print(f"\n[Evaluation] Final per-joint analysis:")
+    correlations = evaluate_per_joint(trainer, dataset)
+    
+    # Check if any joint has very low correlation
+    if min(correlations) < 0.2:
+        bad_joints = [j for j, c in enumerate(correlations) if c < 0.2]
+        print(f"\n⚠️ WARNING: Joints {bad_joints} have low correlation!")
+        print("   Consider: more epochs, different learning rate, or checking data")
     
     print("\n" + "=" * 70)
     print("Training complete!")
@@ -334,7 +291,7 @@ def main():
     trainer.save(model_path)
     print(f"Saved to {model_path}.pt")
     
-    # Final robot validation
+    # Final robot validation (extra long)
     if args.robot_validation:
         print("\n[Final Robot Validation]")
         try:

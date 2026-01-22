@@ -51,7 +51,8 @@ class Trainer():
                 validation_freq: int = 100,
                 validation_trajectories: int = 10,
                 action_is_velocity: bool = True,
-                dt: float = 0.02):
+                dt: float = 0.02,
+                validation_callback=None):
 
         self.traj_dataset = dataset
         self.act_dim = dataset.act_dim
@@ -76,6 +77,7 @@ class Trainer():
         self.validation_trajectories = validation_trajectories
         self.action_is_velocity = action_is_velocity
         self.dt = dt
+        self.validation_callback = validation_callback
         
         # Will be set after training
         self.model = None
@@ -635,6 +637,8 @@ class Trainer():
             shared_state_embedding=self.shared_state_embedding,
             use_action_tanh=self.use_action_tanh,
         ).to(device)
+        
+        self.model = model
 
         optimizer = torch.optim.AdamW(
                             model.parameters(),
@@ -741,6 +745,11 @@ class Trainer():
                 tqdm.write(f"Performing validation rollout at epoch {epoch}...")
                 validation_mse = self.validate_rollout(model, device)
                 tqdm.write(f"Validation MSE: {validation_mse:.6f}")
+                
+                # Call validation callback if provided
+                if self.validation_callback is not None:
+                    self.validation_callback(self, epoch)
+                    
                 if self.wandb_on:
                     wandb.log({"Validation_MSE": validation_mse})
             

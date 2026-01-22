@@ -1928,6 +1928,7 @@ class HFActionChunkingTrainer:
         validation_trajectories: int = 10,
         action_is_velocity: bool = True,
         dt: float = 0.02,
+        validation_callback=None,
     ):
         if not HAS_TRANSFORMERS:
             raise ImportError("HuggingFace Transformers not installed.")
@@ -1959,6 +1960,7 @@ class HFActionChunkingTrainer:
         self.validation_trajectories = validation_trajectories
         self.action_is_velocity = action_is_velocity
         self.dt = dt
+        self.validation_callback = validation_callback
         
         self.act_dim = dataset.act_dim
         self.state_token_dims = dataset.state_token_dims
@@ -2387,6 +2389,8 @@ class HFActionChunkingTrainer:
         
         model = self._create_model()
         
+        self.model = model
+        
         if not (self.load_in_8bit or self.load_in_4bit):
             model = model.to(device)
         
@@ -2564,6 +2568,11 @@ class HFActionChunkingTrainer:
                 tqdm.write(f"Epoch {epoch}: Loss = {avg_loss:.6f}, Validating...")
                 validation_mse = self.validate_rollout(model, device)
                 tqdm.write(f"  Validation MSE: {validation_mse:.6f}")
+                
+                 # Call validation callback if provided
+                if self.validation_callback is not None:
+                    self.validation_callback(self, epoch)
+
             
             avg_loss = np.mean(log_losses) if log_losses else 0.0
             csv_writer.writerow([avg_loss, validation_mse])
