@@ -93,6 +93,47 @@ def evaluate_robot_rollout(trainer, epoch, n_steps=500, seed=42):
     # Create environment with video recording
     cfg = ConfigRegistry.create_from_name("modular_quadruped")
     cfg.control.default_dof_pos = [0, 0, 0, 0, 0]
+    
+    # PATCH: Fix observation structure to match training data
+    # Training data (batch_record_rollout.py) uses manual per-module extraction:
+    # [proj_grav, gyro, dof_pos, dof_vel] per module (raw dof_pos, no cos transform)
+    # But modular_quadruped.yaml puts dof_pos/vel in global components with cos transform.
+    if hasattr(cfg.observation, "modular"):
+        # 1. Remove global components dof_pos and dof_vel
+        if hasattr(cfg.observation.modular, "global_components"):
+            # Use OmegaConf for proper list manipulation if it's a config object
+            global_comps = cfg.observation.modular.global_components
+            cfg.observation.modular.global_components = [
+                c for c in global_comps 
+                if (c if isinstance(c, str) else c["name"]) not in ["dof_pos", "dof_vel"]
+            ]
+            
+        # 2. Add to per-module components if not present
+        per_module = cfg.observation.modular.per_module_components
+        # Check current names
+        current_names = [
+            (c if isinstance(c, str) else c["name"]) for c in per_module
+        ]
+        
+        # Add dof_pos (raw, index_type=slice)
+        if "dof_pos" not in current_names:
+            from omegaconf import OmegaConf
+            per_module.append(OmegaConf.create({
+                "name": "dof_pos",
+                "index_type": "slice",
+                "slice_size": 1,
+                # "transform": "cos"  # REMOVED to match batch_record_rollout.py (raw)
+            }))
+        
+        # Add dof_vel (raw, index_type=slice)
+        if "dof_vel" not in current_names:
+            from omegaconf import OmegaConf
+            per_module.append(OmegaConf.create({
+                "name": "dof_vel",
+                "index_type": "slice",
+                "slice_size": 1
+            }))
+            
     cfg.simulation.render = True
     cfg.simulation.render_mode = "mp4"
     cfg.simulation.video_record_interval = 1  # Record every episode
@@ -169,7 +210,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--rollout-path", default=DEFAULT_ROLLOUT_PATH)
     parser.add_argument("--n-epochs", type=int, default=500)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--no-flow-matching", action="store_true", 
                         help="Disable flow matching (simpler, for debugging)")
