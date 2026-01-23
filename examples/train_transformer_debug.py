@@ -111,6 +111,10 @@ def evaluate_robot_rollout(trainer, epoch, n_steps=500, seed=42):
     env_log_dir = getattr(env, '_log_dir', './logs')
     print(f"  Video will be saved to: {env_log_dir}")
     
+    # Get observation structure info for debugging
+    obs_info = env.state.get_modular_observation_info()
+    print(f"  Observation structure: {obs_info['num_modules']} modules × {obs_info['per_module_obs_size']} + {obs_info['global_obs_size']} global = {obs_info['total_obs_size']} total")
+    
     # Run rollout
     total_reward = 0.0
     positions = []
@@ -118,8 +122,9 @@ def evaluate_robot_rollout(trainer, epoch, n_steps=500, seed=42):
     for step in range(n_steps):
         t0 = time.time()
         
-        # Get action from policy
-        state = {f'module{i}': obs[i*8:(i+1)*8] for i in range(5)}
+        # Get action from policy - use unified API for observation parsing
+        # This ensures alignment between training data and inference
+        state = env.state.flat_obs_to_dict(obs)
         action = policy.step(state)
         
         # Step environment
@@ -246,7 +251,7 @@ def main():
             log_dir=args.log_dir,
             batch_size=args.batch_size,
             learning_rate=args.lr,
-            validation_freq=100,  # More frequent validation
+            validation_freq=1000,  # More frequent validation
             action_is_velocity=True,
             validation_callback=robot_validation_callback if args.robot_validation else None,
         )
@@ -270,7 +275,7 @@ def main():
             
             batch_size=args.batch_size,
             learning_rate=args.lr,
-            validation_freq=10,  # More frequent validation
+            validation_freq=1000,  # More frequent validation
             action_is_velocity=True,
             validation_callback=robot_validation_callback if args.robot_validation else None,
         )
