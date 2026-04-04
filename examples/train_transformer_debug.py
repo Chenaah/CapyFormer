@@ -10,6 +10,7 @@ Key fixes:
 """
 
 import argparse
+import glob as glob_module
 import pickle
 import numpy as np
 import torch
@@ -23,19 +24,131 @@ DEFAULT_ROLLOUT_PATH = "batch_rollouts.pkl"
 DEFAULT_LOG_DIR = "./debug/transformer_debug"
 
 
-def create_dataset_class(rollout_path):
-    """Create dataset class."""
+def create_dataset_class(rollout_paths, normalize_actions=True):
+    """Create dataset class.
+    
+    Args:
+        rollout_paths: List of paths to rollout data files.
+        normalize_actions: If True, normalize actions to zero-mean unit-variance
+            across the combined dataset. This is critical when combining data from
+            robots with different optimized poses (different default_dof_pos), since
+            their absolute action ranges differ wildly even though the relative
+            motion patterns are similar.
+    """
+    if isinstance(rollout_paths, str):
+        rollout_paths = [rollout_paths]
+        
     class QuadrupedDataset(TrajectoryDataset):
         def _setup_dataset(self, dataset_config):
-            rollout_data = pickle.load(open(rollout_path, "rb"))
-            self.trajectories = rollout_data["trajectories"]
+            self.trajectories = []
+            for path in rollout_paths:
+                print(f"Loading data from: {path}")
+                rollout_data = pickle.load(open(path, "rb"))
+                self.trajectories.extend(rollout_data["trajectories"])
+            
             self.input_keys = [f"module{i}" for i in range(5)]
             self.target_key = "actions"
-            print(f"Loaded {len(self.trajectories)} trajectories")
+            print(f"Total loaded {len(self.trajectories)} trajectories from {len(rollout_paths)} files")
             self.pad_value = 0.0
             self.val_split = 0.1
+            
+            # Normalize actions across the combined dataset
+            if normalize_actions:
+                all_actions = np.concatenate(
+                    [traj["actions"] for traj in self.trajectories], axis=0
+                )
+                self.action_mean = np.mean(all_actions, axis=0)
+                self.action_std = np.std(all_actions, axis=0) + 1e-6
+                
+                print(f"  Action normalization enabled:")
+                print(f"    action_mean = {self.action_mean}")
+                print(f"    action_std  = {self.action_std}")
+                
+                for traj in self.trajectories:
+                    traj["actions"] = (traj["actions"] - self.action_mean) / self.action_std
+                
+                print(f"    Normalized action range: [{all_actions.min():.3f}, {all_actions.max():.3f}] "
+                      f"-> [{((all_actions - self.action_mean) / self.action_std).min():.3f}, "
+                      f"{((all_actions - self.action_mean) / self.action_std).max():.3f}]")
+            else:
+                self.action_mean = None
+                self.action_std = None
     
     return QuadrupedDataset
+
+
+def create_isaac_sim_dataset_class(rollout_paths, normalize_actions=True):
+    """Create dataset class for Isaac Sim expert data.
+    
+    Isaac Sim data has flat observations (T, obs_dim), actions (T, act_dim),
+    and commands (T, cmd_dim). We treat 'observations' and 'commands' as
+    two separate input tokens for the transformer.
+    
+    Args:
+        rollout_paths: List of paths to rollout data files.
+        normalize_actions: If True, normalize actions to zero-mean unit-variance.
+    """
+    if isinstance(rollout_paths, str):
+        rollout_paths = [rollout_paths]
+        
+    class IsaacSimDataset(TrajectoryDataset):
+        def _setup_dataset(self, dataset_config):
+            self.trajectories = []
+            for path in rollout_paths:
+                print(f"Loading Isaac Sim data from: {path}")
+                rollout_data = pickle.load(open(path, "rb"))
+                raw_trajs = rollout_data["trajectories"]
+                
+                for traj in raw_trajs:
+                    # Keep only the keys we need as input tokens + target
+                    # NOTE: We rename "observations" -> "obs" to avoid triggering
+                    # TrajectoryDataset's legacy format detection, which treats
+                    # the combo of "observations" + "actions" keys as legacy format
+                    # and expects observations to be a dict of sub-observations.
+                    clean_traj = {}
+                    
+                    # Input tokens
+                    if "observations" in traj:
+                        clean_traj["obs"] = np.array(traj["observations"], dtype=np.float32)
+                    if "commands" in traj:
+                        clean_traj["commands"] = np.array(traj["commands"], dtype=np.float32)
+                    
+                    # Target
+                    clean_traj["actions"] = np.array(traj["actions"], dtype=np.float32)
+                    
+                    self.trajectories.append(clean_traj)
+            
+            self.input_keys = ["obs", "commands"]
+            self.target_key = "actions"
+            self.pad_value = 0.0
+            self.val_split = 0.1
+            
+            print(f"Total loaded {len(self.trajectories)} trajectories from {len(rollout_paths)} files")
+            if self.trajectories:
+                t0 = self.trajectories[0]
+                for k, v in t0.items():
+                    if isinstance(v, np.ndarray):
+                        print(f"  {k}: shape={v.shape}")
+            
+            # Normalize actions across the combined dataset
+            if normalize_actions:
+                all_actions = np.concatenate(
+                    [traj["actions"] for traj in self.trajectories], axis=0
+                )
+                self.action_mean = np.mean(all_actions, axis=0)
+                self.action_std = np.std(all_actions, axis=0) + 1e-6
+                
+                print(f"  Action normalization enabled:")
+                print(f"    action_mean = {self.action_mean}")
+                print(f"    action_std  = {self.action_std}")
+                
+                for traj in self.trajectories:
+                    traj["actions"] = (traj["actions"] - self.action_mean) / self.action_std
+            else:
+                self.action_mean = None
+                self.action_std = None
+    
+    return IsaacSimDataset
 
 
 def evaluate_per_joint(trainer, dataset, n_trajs=10):
@@ -46,14 +159,17 @@ def evaluate_per_joint(trainer, dataset, n_trajs=10):
     all_pred = []
     all_true = []
     
+    input_names = dataset.input_token_names
+    n_joints = dataset.target_dim
+    
     for traj_idx in range(min(n_trajs, len(dataset.val_trajectories))):
         traj = dataset.val_trajectories[traj_idx]
         inference.reset()
         
-        for t in range(min(50, len(traj['actions']))):
-            state = {f'module{i}': traj[f'module{i}'][t] for i in range(5)}
+        for t in range(min(50, len(traj[dataset.target_key]))):
+            state = {name: traj[name][t] for name in input_names if name in traj}
             pred = inference.step(state)
-            true = traj['actions'][t]
+            true = traj[dataset.target_key][t]
             all_pred.append(pred)
             all_true.append(true)
     
@@ -61,7 +177,7 @@ def evaluate_per_joint(trainer, dataset, n_trajs=10):
     all_true = np.array(all_true)
     
     print("\nPer-joint evaluation:")
-    for j in range(5):
+    for j in range(n_joints):
         corr = np.corrcoef(all_pred[:, j], all_true[:, j])[0, 1]
         mae = np.abs(all_pred[:, j] - all_true[:, j]).mean()
         print(f"  Joint {j}: correlation={corr:.3f}, MAE={mae:.3f}")
@@ -70,7 +186,8 @@ def evaluate_per_joint(trainer, dataset, n_trajs=10):
     return correlations
 
 
-def evaluate_robot_rollout(trainer, epoch, n_steps=500, seed=42):
+def evaluate_robot_rollout(trainer, epoch, n_steps=500, seed=42, 
+                           action_mean=None, action_std=None):
     """
     Run robot rollout with the trained policy and record video.
     
@@ -79,6 +196,8 @@ def evaluate_robot_rollout(trainer, epoch, n_steps=500, seed=42):
         epoch: Current epoch (for video naming)
         n_steps: Number of steps to run
         seed: Random seed for environment
+        action_mean: If provided, denormalize predicted actions: action = pred * std + mean
+        action_std: If provided, denormalize predicted actions: action = pred * std + mean
     
     Returns:
         dict with metrics (total_reward, distance_traveled, avg_reward)
@@ -90,9 +209,13 @@ def evaluate_robot_rollout(trainer, epoch, n_steps=500, seed=42):
     policy = trainer.get_inference()
     policy.reset()
     
+    if action_mean is not None:
+        print(f"  Action denormalization: mean={action_mean}, std={action_std}")
+    
     # Create environment with video recording
     cfg = ConfigRegistry.create_from_name("modular_quadruped")
     cfg.control.default_dof_pos = [0, 0, 0, 0, 0]
+    cfg.control.symmetric_limit = 100
     
     # Explicitly set initialization pose to avoid collapsed start (since default_dof_pos is 0)
     if 'initialization' not in cfg:
@@ -106,7 +229,6 @@ def evaluate_robot_rollout(trainer, epoch, n_steps=500, seed=42):
     
     env = MetaMachine(cfg)
     obs, _ = env.reset(seed=seed)
-    
     # Get the log directory from MetaMachine
     env_log_dir = getattr(env, '_log_dir', './logs')
     print(f"  Video will be saved to: {env_log_dir}")
@@ -126,6 +248,10 @@ def evaluate_robot_rollout(trainer, epoch, n_steps=500, seed=42):
         # This ensures alignment between training data and inference
         state = env.state.flat_obs_to_dict(obs)
         action = policy.step(state)
+        
+        # Denormalize actions if normalization stats are provided
+        if action_mean is not None and action_std is not None:
+            action = action * action_std + action_mean
         
         # Step environment
         obs, reward, done, truncated, info = env.step(action)
@@ -179,7 +305,11 @@ def evaluate_robot_rollout(trainer, epoch, n_steps=500, seed=42):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--rollout-path", default=DEFAULT_ROLLOUT_PATH)
+    parser.add_argument("--rollout-path", nargs="+", default=[DEFAULT_ROLLOUT_PATH])
+    parser.add_argument("--rollout-dir", type=str, default=None,
+                        help="Directory containing *_expert_data.pkl files. "
+                             "If provided, all matching PKL files will be loaded "
+                             "(overrides --rollout-path).")
     parser.add_argument("--n-epochs", type=int, default=500)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -193,11 +323,42 @@ def main():
                         help="Directory for logs and videos")
     parser.add_argument("--robot-validation", default=True, action="store_true",
                         help="Run robot rollout validation with video recording")
-    parser.add_argument("--robot-val-steps", type=int, default=500,
+    parser.add_argument("--no-robot-validation", dest="robot_validation", action="store_false",
+                        help="Disable robot rollout validation (use when env is not available)")
+    parser.add_argument("--robot-val-steps", type=int, default=200,
                         help="Number of steps for robot validation")
     parser.add_argument("--use-simple-trainer", action="store_true",
                         help="Use the simple Trainer instead of HFActionChunkingTrainer")
+    parser.add_argument("--use-lora", action="store_true", default=False,
+                        help="Use LoRA for efficient fine-tuning")
+    parser.add_argument("--load-in-4bit", action="store_true",
+                        help="Load model in 4-bit quantization")
+    parser.add_argument("--resume-checkpoint", type=str, default=None,
+                        help="Path to checkpoint to resume training from (e.g. ./logs/transformer_multi_expert/final_model.pt)")
+    parser.add_argument("--normalize-actions", default=True, action="store_true",
+                        help="Normalize actions to zero-mean unit-variance (recommended for multi-robot data)")
+    parser.add_argument("--no-normalize-actions", dest="normalize_actions", action="store_false",
+                        help="Disable action normalization")
+    parser.add_argument("--isaac-sim-format", action="store_true", default=False,
+                        help="Use Isaac Sim flat observation format (observations + commands as input tokens)")
+    parser.add_argument("--eval-config", type=str, default=None,
+                        help="Path to env config YAML for periodic eval with video (e.g. path/to/new_five_modules_v11.yaml)")
+    parser.add_argument("--eval-steps", type=int, default=200,
+                        help="Number of steps for periodic eval rollouts")
+    parser.add_argument("--validation-freq", type=int, default=500,
+                        help="Run validation + video callback every N epochs")
     args = parser.parse_args()
+    
+    # If --rollout-dir is provided, glob all PKL files from that directory
+    if args.rollout_dir is not None:
+        pattern = os.path.join(args.rollout_dir, "*_expert_data.pkl")
+        found = sorted(glob_module.glob(pattern))
+        if not found:
+            raise FileNotFoundError(f"No *_expert_data.pkl files found in {args.rollout_dir}")
+        args.rollout_path = found
+        print(f"Found {len(found)} PKL files in {args.rollout_dir}:")
+        for p in found:
+            print(f"  {os.path.basename(p)}")
     
     # Create log directory
     os.makedirs(args.log_dir, exist_ok=True)
@@ -217,8 +378,16 @@ def main():
     print("=" * 70)
     
     # Create dataset
-    DatasetClass = create_dataset_class(args.rollout_path)
+    if args.isaac_sim_format:
+        print("Using Isaac Sim flat observation format")
+        DatasetClass = create_isaac_sim_dataset_class(args.rollout_path, normalize_actions=args.normalize_actions)
+    else:
+        DatasetClass = create_dataset_class(args.rollout_path, normalize_actions=args.normalize_actions)
     dataset = DatasetClass({"val_split": 0.1}, context_len=args.context_len)
+    
+    # Store action normalization stats for later use
+    action_mean = getattr(dataset, 'action_mean', None)
+    action_std = getattr(dataset, 'action_std', None)
     
     
     # Define validation callback
@@ -232,7 +401,9 @@ def main():
             metrics = evaluate_robot_rollout(
                 trainer_instance, 
                 epoch=epoch_num, 
-                n_steps=args.robot_val_steps
+                n_steps=args.robot_val_steps,
+                action_mean=action_mean,
+                action_std=action_std,
             )
             print(f"  Total reward: {metrics['total_reward']:.2f}")
             print(f"  Avg reward/step: {metrics['avg_reward']:.4f}")
@@ -242,6 +413,52 @@ def main():
             print(f"  Robot validation failed: {e}")
             import traceback
             traceback.print_exc()
+    
+    # Define Isaac Sim eval callback (runs MuJoCo eval with video)
+    def isaac_sim_eval_callback(trainer_instance, epoch_num):
+        """Run Isaac Sim transformer evaluation on MuJoCo with video recording."""
+        print(f"\n[Isaac Sim Eval] Running eval with video for epoch {epoch_num}...")
+        try:
+            import sys
+            project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+            if project_root not in sys.path:
+                sys.path.insert(0, project_root)
+            from evaluate_isaac_sim_transformer import evaluate as isaac_eval
+            import json
+            
+            # Save action norm to checkpoint so evaluate can load it
+            if action_mean is not None:
+                checkpoint_path = os.path.join(args.log_dir, "latest_checkpoint.pt")
+                if os.path.exists(checkpoint_path):
+                    ckpt = torch.load(checkpoint_path, map_location="cpu")
+                    ckpt["action_norm"] = {
+                        "action_mean": action_mean.tolist(),
+                        "action_std": action_std.tolist(),
+                    }
+                    torch.save(ckpt, checkpoint_path)
+            
+            # Run evaluation
+            isaac_eval(
+                checkpoint_path=os.path.join(args.log_dir, "latest_checkpoint.pt"),
+                config_path=args.eval_config,
+                n_steps=args.eval_steps,
+                seed=42,
+                forward_speed=0.5,
+                turn_rate=0.0,
+            )
+            print(f"  [Isaac Sim Eval] Epoch {epoch_num} eval complete!")
+        except Exception as e:
+            print(f"  [Isaac Sim Eval] Failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # Determine which callback to use
+    if args.eval_config and args.isaac_sim_format:
+        active_callback = isaac_sim_eval_callback
+    elif args.robot_validation:
+        active_callback = robot_validation_callback
+    else:
+        active_callback = None
 
     # Create trainer based on selection
     if args.use_simple_trainer:
@@ -251,9 +468,9 @@ def main():
             log_dir=args.log_dir,
             batch_size=args.batch_size,
             learning_rate=args.lr,
-            validation_freq=1000,  # More frequent validation
+            validation_freq=args.validation_freq,
             action_is_velocity=True,
-            validation_callback=robot_validation_callback if args.robot_validation else None,
+            validation_callback=active_callback,
         )
     else:
         # Use HFActionChunkingTrainer with debug-friendly settings
@@ -270,15 +487,22 @@ def main():
             use_flow_matching=not args.no_flow_matching,
             flow_matching_steps=10 if not args.no_flow_matching else 0,
             
-            use_lora=False,
-            freeze_backbone=False,
+            use_lora=args.use_lora,
+            load_in_4bit=args.load_in_4bit,
+            freeze_backbone=False, # Train the whole model (270M parameters)
             
             batch_size=args.batch_size,
             learning_rate=args.lr,
-            validation_freq=1000,  # More frequent validation
+            validation_freq=args.validation_freq,
             action_is_velocity=True,
-            validation_callback=robot_validation_callback if args.robot_validation else None,
+            validation_callback=active_callback,
         )
+    
+    # Load checkpoint if resuming
+    if args.resume_checkpoint:
+        print(f"\n[Resume] Loading checkpoint from: {args.resume_checkpoint}")
+        trainer.load(args.resume_checkpoint)
+        print(f"[Resume] Model loaded, continuing training on new data...")
     
     # Train in one go, validation callbacks will handle the rest
     print(f"\n[Training] Training for {args.n_epochs} epochs...")
@@ -302,6 +526,25 @@ def main():
     trainer.save(model_path)
     print(f"Saved to {model_path}.pt")
     
+    # Save action normalization stats alongside the checkpoint
+    if action_mean is not None:
+        import json
+        action_norm_path = os.path.join(args.log_dir, "action_norm.json")
+        action_norm = {
+            "action_mean": action_mean.tolist(),
+            "action_std": action_std.tolist(),
+        }
+        with open(action_norm_path, "w") as f:
+            json.dump(action_norm, f, indent=2)
+        print(f"Action normalization stats saved to {action_norm_path}")
+        
+        # Also patch into the checkpoint so it's self-contained
+        checkpoint_path = model_path + ".pt"
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        checkpoint["action_norm"] = action_norm
+        torch.save(checkpoint, checkpoint_path)
+        print(f"Action normalization stats also saved in checkpoint")
+    
     # Final robot validation (extra long)
     if args.robot_validation:
         print("\n[Final Robot Validation]")
@@ -309,7 +552,9 @@ def main():
             metrics = evaluate_robot_rollout(
                 trainer,
                 epoch=args.n_epochs,
-                n_steps=args.robot_val_steps * 2  # Longer final rollout
+                n_steps=args.robot_val_steps * 2,  # Longer final rollout
+                action_mean=action_mean,
+                action_std=action_std,
             )
             print(f"  Final total reward: {metrics['total_reward']:.2f}")
             print(f"  Final distance: {metrics['distance']:.3f}m")

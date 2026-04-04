@@ -23,7 +23,7 @@ DEFAULT_ROLLOUT_PATHS = ["batch_rollouts.pkl"]
 DEFAULT_MODEL_SAVE_PATH = "./models/my_model11"
 DEFAULT_LOG_DIR = "./debug"
 DEFAULT_CONTEXT_LEN = 20
-DEFAULT_N_EPOCHS = 2000
+DEFAULT_N_EPOCHS = 10
 DEFAULT_BATCH_SIZE = 32
 # ===============================================
 

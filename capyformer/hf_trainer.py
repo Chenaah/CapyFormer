@@ -49,7 +49,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm, trange
 
 try:
-    from transformers import AutoModelForCausalLM, AutoConfig, AutoTokenizer
+    from transformers import AutoModel, AutoConfig, AutoTokenizer
     from transformers import BitsAndBytesConfig
     HAS_TRANSFORMERS = True
 except ImportError:
@@ -1379,7 +1379,7 @@ class HFTrainer:
 
 
 
-        hf_model = AutoModelForCausalLM.from_pretrained(
+        hf_model = AutoModel.from_pretrained(
             self.model_name,
             quantization_config=quantization_config,
             torch_dtype=torch.float16 if (self.load_in_8bit or self.load_in_4bit) else torch.float32,
@@ -1401,7 +1401,7 @@ class HFTrainer:
                 lora_dropout=self.lora_dropout,
                 target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],  # Common attention modules
                 bias="none",
-                task_type=TaskType.CAUSAL_LM,
+                task_type=None,
             )
             hf_model = get_peft_model(hf_model, lora_config)
             hf_model.print_trainable_parameters()
@@ -1600,7 +1600,7 @@ class HFTrainer:
         
         # Load HF model backbone
         print(f"Loading HuggingFace model: {trainer.model_name}")
-        hf_model = AutoModelForCausalLM.from_pretrained(
+        hf_model = AutoModel.from_pretrained(
             trainer.model_name,
             torch_dtype=torch.float32,
             trust_remote_code=True,
@@ -1989,7 +1989,7 @@ class HFActionChunkingTrainer:
                 bnb_4bit_compute_dtype=torch.float16,
             )
         
-        hf_model = AutoModelForCausalLM.from_pretrained(
+        hf_model = AutoModel.from_pretrained(
             self.model_name,
             quantization_config=quantization_config,
             torch_dtype=torch.float16 if (self.load_in_8bit or self.load_in_4bit) else torch.float32,
@@ -2009,7 +2009,7 @@ class HFActionChunkingTrainer:
                 lora_dropout=self.lora_dropout,
                 target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
                 bias="none",
-                task_type=TaskType.CAUSAL_LM,
+                task_type=None,
             )
             hf_model = get_peft_model(hf_model, lora_config)
             hf_model.print_trainable_parameters()
@@ -2080,6 +2080,13 @@ class HFActionChunkingTrainer:
                 "state_std": state_std,
             },
             "trainer_config": {
+                "use_lora": self.use_lora,
+                "lora_r": self.lora_r,
+                "lora_alpha": self.lora_alpha,
+                "lora_dropout": self.lora_dropout,
+                "freeze_backbone": self.freeze_backbone,
+                "load_in_8bit": self.load_in_8bit,
+                "load_in_4bit": self.load_in_4bit,
                 "execute_horizon": self.execute_horizon,
                 "action_is_velocity": self.action_is_velocity,
                 "dt": self.dt,
@@ -2107,6 +2114,33 @@ class HFActionChunkingTrainer:
         
         model_config = checkpoint["model_config"]
         trainer_config = checkpoint.get("trainer_config", {})
+        model_state_dict = checkpoint["model_state_dict"]
+        
+        def _infer_lora_rank(state_dict):
+            for key, value in state_dict.items():
+                if "lora_A" in key and hasattr(value, "shape") and len(value.shape) >= 1:
+                    return value.shape[0]
+            return None
+        
+        use_lora = trainer_config.get("use_lora")
+        if use_lora is None:
+            use_lora = any("lora_" in k or "base_model.model" in k for k in model_state_dict)
+        
+        self.use_lora = use_lora
+        if self.use_lora:
+            if not HAS_PEFT:
+                raise ImportError("PEFT not installed but use_lora=True.")
+            inferred_r = trainer_config.get("lora_r")
+            if inferred_r is None:
+                inferred_r = _infer_lora_rank(model_state_dict)
+            if inferred_r is not None:
+                self.lora_r = inferred_r
+            self.lora_alpha = trainer_config.get("lora_alpha", self.lora_r * 2)
+            self.lora_dropout = trainer_config.get("lora_dropout", self.lora_dropout)
+        
+        self.freeze_backbone = trainer_config.get("freeze_backbone", self.freeze_backbone)
+        self.load_in_8bit = trainer_config.get("load_in_8bit", self.load_in_8bit)
+        self.load_in_4bit = trainer_config.get("load_in_4bit", self.load_in_4bit)
         
         # Update trainer config
         self.execute_horizon = trainer_config.get("execute_horizon", self.execute_horizon)
@@ -2124,11 +2158,33 @@ class HFActionChunkingTrainer:
         state_std = model_config.get("state_std")
         
         # Get backbone
-        backbone = AutoModelForCausalLM.from_pretrained(
+        quantization_config = None
+        if self.load_in_8bit or self.load_in_4bit:
+            quantization_config = BitsAndBytesConfig(
+                load_in_8bit=self.load_in_8bit,
+                load_in_4bit=self.load_in_4bit,
+                bnb_4bit_compute_dtype=torch.float16,
+            )
+        
+        backbone = AutoModel.from_pretrained(
             model_config["model_name"],
-            torch_dtype=torch.float32,
+            quantization_config=quantization_config,
+            torch_dtype=torch.float16 if (self.load_in_8bit or self.load_in_4bit) else torch.float32,
+            device_map="auto" if (self.load_in_8bit or self.load_in_4bit) else None,
             trust_remote_code=True,
         )
+        
+        if self.use_lora:
+            print(f"Applying LoRA (r={self.lora_r}, alpha={self.lora_alpha})")
+            lora_config = LoraConfig(
+                r=self.lora_r,
+                lora_alpha=self.lora_alpha,
+                lora_dropout=self.lora_dropout,
+                target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+                bias="none",
+                task_type=None,
+            )
+            backbone = get_peft_model(backbone, lora_config)
         
         # Get hidden_dim from backbone config
         hidden_dim = backbone.config.hidden_size
@@ -2147,7 +2203,7 @@ class HFActionChunkingTrainer:
         )
         
         # Load weights
-        model.load_state_dict(checkpoint["model_state_dict"])
+        model.load_state_dict(model_state_dict)
         model.to(device)
         model.eval()
         
@@ -2194,6 +2250,13 @@ class HFActionChunkingTrainer:
         
         model_config = checkpoint["model_config"]
         trainer_config = checkpoint.get("trainer_config", {})
+        model_state_dict = checkpoint["model_state_dict"]
+        
+        def _infer_lora_rank(state_dict):
+            for key, value in state_dict.items():
+                if "lora_A" in key and hasattr(value, "shape") and len(value.shape) >= 1:
+                    return value.shape[0]
+            return None
         
         # Get state stats from checkpoint
         state_mean = model_config.get("state_mean")
@@ -2242,13 +2305,55 @@ class HFActionChunkingTrainer:
         trainer.validation_freq = 100
         trainer.validation_trajectories = 10
         
+        use_lora = trainer_config.get("use_lora")
+        if use_lora is None:
+            use_lora = any("lora_" in k or "base_model.model" in k for k in model_state_dict)
+        
+        trainer.use_lora = use_lora
+        if trainer.use_lora:
+            if not HAS_PEFT:
+                raise ImportError("PEFT not installed but use_lora=True.")
+            inferred_r = trainer_config.get("lora_r")
+            if inferred_r is None:
+                inferred_r = _infer_lora_rank(model_state_dict)
+            if inferred_r is not None:
+                trainer.lora_r = inferred_r
+            trainer.lora_alpha = trainer_config.get("lora_alpha", trainer.lora_r * 2)
+            trainer.lora_dropout = trainer_config.get("lora_dropout", trainer.lora_dropout)
+        
+        trainer.freeze_backbone = trainer_config.get("freeze_backbone", trainer.freeze_backbone)
+        trainer.load_in_8bit = trainer_config.get("load_in_8bit", trainer.load_in_8bit)
+        trainer.load_in_4bit = trainer_config.get("load_in_4bit", trainer.load_in_4bit)
+        
         # Load HF model backbone
         print(f"Loading HuggingFace model: {trainer.model_name}")
-        hf_model = AutoModelForCausalLM.from_pretrained(
+        quantization_config = None
+        if trainer.load_in_8bit or trainer.load_in_4bit:
+            quantization_config = BitsAndBytesConfig(
+                load_in_8bit=trainer.load_in_8bit,
+                load_in_4bit=trainer.load_in_4bit,
+                bnb_4bit_compute_dtype=torch.float16,
+            )
+        
+        hf_model = AutoModel.from_pretrained(
             trainer.model_name,
-            torch_dtype=torch.float32,
+            quantization_config=quantization_config,
+            torch_dtype=torch.float16 if (trainer.load_in_8bit or trainer.load_in_4bit) else torch.float32,
+            device_map="auto" if (trainer.load_in_8bit or trainer.load_in_4bit) else None,
             trust_remote_code=True,
         )
+        
+        if trainer.use_lora:
+            print(f"Applying LoRA (r={trainer.lora_r}, alpha={trainer.lora_alpha})")
+            lora_config = LoraConfig(
+                r=trainer.lora_r,
+                lora_alpha=trainer.lora_alpha,
+                lora_dropout=trainer.lora_dropout,
+                target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+                bias="none",
+                task_type=None,
+            )
+            hf_model = get_peft_model(hf_model, lora_config)
         
         hidden_dim = hf_model.config.hidden_size
         
@@ -2266,7 +2371,7 @@ class HFActionChunkingTrainer:
             state_std=state_std,
         )
         
-        trainer.model.load_state_dict(checkpoint["model_state_dict"])
+        trainer.model.load_state_dict(model_state_dict)
         trainer.model.to(device)
         trainer.model.eval()
         
@@ -2365,7 +2470,11 @@ class HFActionChunkingTrainer:
         return 0.0
     
     def learn(self, n_epochs: int = None, save_final: bool = True):
-        """Train the Action Chunking model."""
+        """Train the Action Chunking model.
+        
+        If self.model is already set (e.g. from load()), continues training
+        from that checkpoint. Otherwise creates a new model from scratch.
+        """
         device = torch.device(self.device)
         
         log_csv_path = os.path.join(self.log_dir, "log.csv")
@@ -2387,9 +2496,12 @@ class HFActionChunkingTrainer:
         
         n_epochs = n_epochs or int(1e6 / len(traj_data_loader))
         
-        model = self._create_model()
-        
-        self.model = model
+        if self.model is not None:
+            print("Resuming training from existing model checkpoint")
+            model = self.model
+        else:
+            model = self._create_model()
+            self.model = model
         
         if not (self.load_in_8bit or self.load_in_4bit):
             model = model.to(device)
@@ -2576,6 +2688,20 @@ class HFActionChunkingTrainer:
             
             avg_loss = np.mean(log_losses) if log_losses else 0.0
             csv_writer.writerow([avg_loss, validation_mse])
+            
+            # Periodic checkpoint saving (every 100 epochs)
+            if (epoch + 1) % 100 == 0:
+                periodic_path = os.path.join(self.log_dir, "latest_checkpoint")
+                self.model = model
+                self.save(periodic_path)
+                tqdm.write(f"  [Checkpoint] Saved at epoch {epoch + 1}")
+                
+                # Run validation callback (e.g. robot eval with video)
+                if self.validation_callback is not None:
+                    try:
+                        self.validation_callback(self, epoch + 1)
+                    except Exception as e:
+                        tqdm.write(f"  [Eval] Callback failed: {e}")
         
         self.model = model
         
